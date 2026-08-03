@@ -1,3 +1,36 @@
+# Q-Seed Framework Fork
+
+This repository is the public, user-controlled Qwen Code fork that provides
+the framework layer for [Q-Seed](https://github.com/hadi-nayebi/q-seed). Q-Seed
+combines this independently versioned runtime with an inspectable cognitive
+and plugin brain; it does not present the framework fork itself as the whole
+agent.
+
+## Fork lineage
+
+- `qseed/main` is the reviewed Q-Seed framework integration line.
+- Framework feature branches target `qseed/main` through complete pull
+  requests with tests, compatibility and recovery evidence, and explicit user
+  approval before merge.
+- The Q-Seed composition repository pins an exact approved framework commit as
+  a Git submodule; it never relies on a moving branch implicitly.
+- Fork `main` remains separate so upstream synchronization and Q-Seed
+  integration history do not become indistinguishable.
+
+The Foundation baseline is upstream Qwen Code `v0.19.10` at
+`095bd160918086a3a33192133e7923635f08f973`. Q-Seed-specific runtime behavior
+has not yet landed. The current work maps existing interception surfaces and
+will introduce only evidence-backed general primitives needed by the cognitive
+layer.
+
+Q-Seed framework changes are intentionally higher-friction than plugin or job
+changes because their blast radius is deeper. The model or harness may prepare
+a proposal, but it cannot approve or silently merge its own framework change.
+
+---
+
+## Upstream Qwen Code
+
 <div align="center">
 
 [![npm version](https://img.shields.io/npm/v/@qwen-code/qwen-code.svg)](https://www.npmjs.com/package/@qwen-code/qwen-code)
