@@ -9,8 +9,11 @@ import { withActionTimeout } from '../timing.js';
 import type {
   DaemonDirectoryListing,
   DaemonFileStat,
+  DaemonGoal,
   DaemonScheduledTask,
   DaemonWorkspaceActions,
+  DaemonWorkspaceDirectoryPickerResult,
+  DaemonWorkspacePathSuggestions,
 } from './types.js';
 
 const AGENT_GENERATE_TIMEOUT_MS = 330_000;
@@ -151,11 +154,143 @@ export function createDaemonWorkspaceActions({
       return result.unarchived.length > 0 || result.alreadyActive.length > 0;
     },
 
+    async loadChannels() {
+      const workspace = requireWorkspaceClient(
+        getClient,
+        getWorkspaceCwd,
+        'Load channels failed',
+      );
+      const [catalog, snapshot] = await withActionTimeout(
+        Promise.all([
+          workspace.workspaceChannelTypes(),
+          workspace.workspaceChannels(),
+        ]),
+        'Load channels timed out',
+      );
+      return { catalog, snapshot };
+    },
+
+    async upsertChannel(name, request) {
+      const workspace = requireWorkspaceClient(
+        getClient,
+        getWorkspaceCwd,
+        'Update channel failed',
+      );
+      return workspace.upsertWorkspaceChannel(name, request);
+    },
+
+    async removeChannel(name, request) {
+      const workspace = requireWorkspaceClient(
+        getClient,
+        getWorkspaceCwd,
+        'Remove channel failed',
+      );
+      return workspace.deleteWorkspaceChannel(name, request);
+    },
+
+    async setChannelStartup(name, request) {
+      const workspace = requireWorkspaceClient(
+        getClient,
+        getWorkspaceCwd,
+        'Update channel startup failed',
+      );
+      return workspace.setWorkspaceChannelStartup(name, request);
+    },
+
+    async startChannel(name) {
+      const workspace = requireWorkspaceClient(
+        getClient,
+        getWorkspaceCwd,
+        'Start channel failed',
+      );
+      return workspace.startWorkspaceChannel(name);
+    },
+
+    async stopChannel(name) {
+      const workspace = requireWorkspaceClient(
+        getClient,
+        getWorkspaceCwd,
+        'Stop channel failed',
+      );
+      return workspace.stopWorkspaceChannel(name);
+    },
+
+    async restartChannel(name) {
+      const workspace = requireWorkspaceClient(
+        getClient,
+        getWorkspaceCwd,
+        'Restart channel failed',
+      );
+      return workspace.restartWorkspaceChannel(name);
+    },
+
+    channelPairing: {
+      async list(name) {
+        const workspace = requireWorkspaceClient(
+          getClient,
+          getWorkspaceCwd,
+          'Load channel pairing requests failed',
+        );
+        return withActionTimeout(
+          workspace.workspaceChannelPairingRequests(name),
+          'Load channel pairing requests timed out',
+        );
+      },
+
+      async approve(name, code) {
+        const workspace = requireWorkspaceClient(
+          getClient,
+          getWorkspaceCwd,
+          'Approve channel pairing failed',
+        );
+        return workspace.approveWorkspaceChannelPairing(name, { code });
+      },
+
+      async approvals(name) {
+        const workspace = requireWorkspaceClient(
+          getClient,
+          getWorkspaceCwd,
+          'Load channel pairing approvals failed',
+        );
+        return withActionTimeout(
+          workspace.workspaceChannelPairingApprovals(name),
+          'Load channel pairing approvals timed out',
+        );
+      },
+
+      async revoke(name, senderId) {
+        const workspace = requireWorkspaceClient(
+          getClient,
+          getWorkspaceCwd,
+          'Revoke channel pairing approval failed',
+        );
+        return workspace.revokeWorkspaceChannelPairingApproval(name, {
+          senderId,
+        });
+      },
+    },
+
     async loadMcpStatus() {
       const client = requireClient(getClient, 'Load MCP status failed');
       return withActionTimeout(
         client.workspaceMcp(),
         'Load MCP status timed out',
+      );
+    },
+
+    async initializeMcp() {
+      const client = requireClient(getClient, 'Initialize MCP failed');
+      return withActionTimeout(
+        client.initializeWorkspaceMcp(),
+        'Initialize MCP timed out',
+      );
+    },
+
+    async reloadMcp() {
+      const client = requireClient(getClient, 'Reload MCP failed');
+      return withActionTimeout(
+        client.reloadWorkspaceMcp(),
+        'Reload MCP timed out',
       );
     },
 
@@ -234,6 +369,24 @@ export function createDaemonWorkspaceActions({
       );
     },
 
+    async addRuntimeMcpServer(request) {
+      const client = requireClient(getClient, 'Add MCP server failed');
+      return withActionTimeout(
+        client.addRuntimeMcpServer(request),
+        'Add MCP server timed out',
+        5 * 60_000,
+      );
+    },
+
+    async removeRuntimeMcpServer(name) {
+      const client = requireClient(getClient, 'Remove MCP server failed');
+      return withActionTimeout(
+        client.removeRuntimeMcpServer(name),
+        'Remove MCP server timed out',
+        5 * 60_000,
+      );
+    },
+
     async loadDaemonStatus(detail) {
       const client = requireClient(getClient, 'Load daemon status failed');
       return withActionTimeout(
@@ -258,6 +411,30 @@ export function createDaemonWorkspaceActions({
       );
     },
 
+    async setWorkspaceSkillEnabled(skillName, enabled) {
+      const client = requireClient(getClient, 'Set skill enabled failed');
+      return withActionTimeout(
+        client.setWorkspaceSkillEnabled(skillName, enabled),
+        'Set skill enabled timed out',
+      );
+    },
+
+    async installWorkspaceSkill(request) {
+      const client = requireClient(getClient, 'Install skill failed');
+      return withActionTimeout(
+        client.installWorkspaceSkill(request),
+        'Install skill timed out',
+      );
+    },
+
+    async deleteWorkspaceSkill(skillName, scope) {
+      const client = requireClient(getClient, 'Delete skill failed');
+      return withActionTimeout(
+        client.deleteWorkspaceSkill(skillName, scope),
+        'Delete skill timed out',
+      );
+    },
+
     async loadExtensionsStatus() {
       const client = requireClient(getClient, 'Load extensions failed');
       return withActionTimeout(
@@ -269,6 +446,15 @@ export function createDaemonWorkspaceActions({
     async loadToolsStatus() {
       const client = requireClient(getClient, 'Load tools failed');
       return withActionTimeout(client.workspaceTools(), 'Load tools timed out');
+    },
+
+    async preheatAcp(timeoutMs) {
+      const client = requireClient(getClient, 'Preheat ACP failed');
+      return withActionTimeout(
+        client.workspaceAcpPreheat(timeoutMs),
+        'Preheat ACP timed out',
+        timeoutMs === undefined ? undefined : timeoutMs + 2_000,
+      );
     },
 
     async setWorkspaceToolEnabled(toolName, enabled) {
@@ -291,10 +477,13 @@ export function createDaemonWorkspaceActions({
       scope: 'workspace' | 'user',
       key: string,
       value: unknown,
+      options?: {
+        mcpServerMutation?: { operation: 'set' | 'remove'; name: string };
+      },
     ) {
       const client = requireClient(getClient, 'Set setting failed');
       return withActionTimeout(
-        client.setWorkspaceSetting(scope, key, value),
+        client.setWorkspaceSetting(scope, key, value, options),
         'Set setting timed out',
       );
     },
@@ -323,6 +512,13 @@ export function createDaemonWorkspaceActions({
       );
     },
 
+    async *generateContent(prompt, opts) {
+      const client = requireClient(getClient, 'Generate content failed');
+      yield* client.generateWorkspaceContent(prompt, {
+        signal: opts?.signal,
+      });
+    },
+
     async listAgents() {
       const client = requireClient(getClient, 'List agents failed');
       return withActionTimeout(
@@ -331,10 +527,10 @@ export function createDaemonWorkspaceActions({
       );
     },
 
-    async getAgent(agentType) {
+    async getAgent(agentType, scope) {
       const client = requireClient(getClient, 'Get agent failed');
       return withActionTimeout(
-        client.getWorkspaceAgent(agentType),
+        client.getWorkspaceAgent(agentType, scope ? { scope } : {}),
         'Get agent timed out',
       );
     },
@@ -568,6 +764,57 @@ export function createDaemonWorkspaceActions({
       }
     },
 
+    // Goals. `GET /goals` is REST-only (like /scheduled-tasks) and not on the
+    // DaemonClient transport; the clear path reuses the existing per-session
+    // route so a page-level clear and a `/goal clear` in chat take the same
+    // code path in the daemon.
+    async listGoals() {
+      requireClient(getClient, 'List goals failed');
+      const url = createDaemonRequestUrl(baseUrl, '/goals');
+      const res = await withActionTimeout(
+        fetch(serializeDaemonRequestUrl(url, baseUrl), {
+          headers: createDaemonHeaders(token),
+        }),
+        'List goals timed out',
+      );
+      if (!res.ok) {
+        throw new Error(await readDaemonError(res, 'GET /goals'));
+      }
+      const data = (await res.json()) as {
+        goals?: DaemonGoal[];
+        droppedCount?: number;
+      };
+      return {
+        goals: Array.isArray(data.goals) ? data.goals : [],
+        droppedCount:
+          typeof data.droppedCount === 'number' && data.droppedCount > 0
+            ? data.droppedCount
+            : 0,
+      };
+    },
+
+    async clearGoal(sessionId) {
+      requireClient(getClient, 'Clear goal failed');
+      const url = createDaemonRequestUrl(
+        baseUrl,
+        `/session/${encodeURIComponent(sessionId)}/goal/clear`,
+      );
+      const res = await withActionTimeout(
+        fetch(serializeDaemonRequestUrl(url, baseUrl), {
+          method: 'POST',
+          headers: createDaemonJsonHeaders(token),
+          body: '{}',
+        }),
+        'Clear goal timed out',
+      );
+      if (!res.ok) {
+        throw new Error(
+          await readDaemonError(res, `POST /session/${sessionId}/goal/clear`),
+        );
+      }
+      return (await res.json()) as { cleared: boolean };
+    },
+
     async loadEnv() {
       const client = requireClient(getClient, 'Load env failed');
       return withActionTimeout(client.workspaceEnv(), 'Load env timed out');
@@ -613,6 +860,38 @@ export function createDaemonWorkspaceActions({
       return withActionTimeout(
         client.extensionOperationStatus(operationId),
         'Load extension operation timed out',
+      );
+    },
+
+    async activeExtensionOperations() {
+      const client = requireClient(
+        getClient,
+        'Load active extension operations failed',
+      );
+      return withActionTimeout(
+        client.activeExtensionOperations(),
+        'Load active extension operations timed out',
+      );
+    },
+
+    async respondToExtensionInteraction(
+      operationId,
+      interactionId,
+      response,
+      clientId,
+    ) {
+      const client = requireClient(
+        getClient,
+        'Respond to extension interaction failed',
+      );
+      return withActionTimeout(
+        client.respondToExtensionInteraction(
+          operationId,
+          interactionId,
+          response,
+          clientId,
+        ),
+        'Respond to extension interaction timed out',
       );
     },
 
@@ -728,6 +1007,42 @@ export function createDaemonWorkspaceActions({
       );
     },
 
+    /** Applies the standard mutation timeout without retrying the POST. */
+    async addScratchWorkspace() {
+      const client = requireClient(getClient, 'Add scratch workspace failed');
+      return withActionTimeout(
+        client.addScratchWorkspace(),
+        'Add scratch workspace timed out',
+      );
+    },
+
+    async suggestWorkspacePaths(prefix) {
+      const client = requireClient(getClient, 'Suggest workspace paths failed');
+      const result = await withActionTimeout(
+        client.workspacePathSuggestions(prefix),
+        'Suggest workspace paths timed out',
+      );
+      return result as DaemonWorkspacePathSuggestions;
+    },
+
+    async pickWorkspaceDirectory() {
+      const client = requireClient(getClient, 'Open directory picker failed');
+      const result = await withActionTimeout(
+        client.workspaceDirectoryPicker(),
+        'Open directory picker timed out',
+        320_000,
+      );
+      return result as DaemonWorkspaceDirectoryPickerResult;
+    },
+
+    async updateWorkspace(workspaceSelector, update) {
+      const client = requireClient(getClient, 'Update workspace failed');
+      return withActionTimeout(
+        client.updateWorkspace(workspaceSelector, update),
+        'Update workspace timed out',
+      );
+    },
+
     async removeWorkspace(workspaceId, options) {
       const client = requireClient(getClient, 'Remove workspace failed');
       const removal = client.workspaceById(workspaceId).remove(options);
@@ -762,6 +1077,15 @@ function requireWorkspaceCwd(
     throw new Error('Daemon workspace is not connected');
   }
   return cwd;
+}
+
+function requireWorkspaceClient(
+  getClient: () => DaemonClient | undefined,
+  getWorkspaceCwd: () => string | undefined,
+  action: string,
+) {
+  const client = requireClient(getClient, action);
+  return client.workspaceByCwd(requireWorkspaceCwd(getWorkspaceCwd));
 }
 
 // Builds a scheduled-tasks REST path. With a `workspaceId` it targets that

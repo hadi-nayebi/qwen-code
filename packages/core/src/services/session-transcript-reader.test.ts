@@ -31,7 +31,6 @@ import {
   resetSessionTranscriptIndexCacheForTest,
   setSessionTranscriptIndexCacheMaxBytesForTest,
   SessionTranscriptCursorCodec,
-  SessionTranscriptPageTooLargeError,
   SessionTranscriptSnapshotUnavailableError,
   SessionTranscriptReader,
 } from './session-transcript-reader.js';
@@ -146,7 +145,39 @@ describe('SessionTranscriptReader', () => {
     expect(page.lastUpdated).toMatch(ISO_8601);
   });
 
-  it.each([0, -1, SESSION_TRANSCRIPT_MAX_LIMIT + 1, 1.5])(
+  it('retains content with an invalid record timestamp', async () => {
+    const invalidTimestamp = record('u1', null, 'kept content');
+    invalidTimestamp.timestamp = 'not-a-date';
+    await writeRecords([invalidTimestamp]);
+
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+    );
+
+    expect(page.records).toHaveLength(1);
+    expect(page.records[0]).toMatchObject({ uuid: 'u1' });
+    expect(page.records[0]?.timestamp).toBeUndefined();
+    expect(Number.isFinite(new Date(page.startTime).getTime())).toBe(true);
+  });
+
+  it('does not select a trailing artifact record as the active leaf', async () => {
+    const root = record('u1', null, 'conversation');
+    const artifact: ChatRecord = {
+      ...record('artifact', 'u1', 'side channel'),
+      type: 'system',
+      subtype: 'session_artifact_event',
+      message: undefined,
+    };
+    await writeRecords([root, artifact]);
+
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+    );
+
+    expect(page.records.map((item) => item.uuid)).toEqual(['u1']);
+  });
+
+  it.each([0, -1, NaN, Infinity, SESSION_TRANSCRIPT_MAX_LIMIT + 1, 1.5])(
     'rejects invalid page limit %s',
     async (limit) => {
       await expect(
@@ -197,7 +228,7 @@ describe('SessionTranscriptReader', () => {
     expect(second.hasMore).toBe(false);
   });
 
-  it('rejects a single aggregate record over the page byte budget', async () => {
+  it('returns a single aggregate record that exceeds the page byte budget', async () => {
     const first = record('u1', null, 'first');
     const second = record('u1', null, 'second fragment');
     await writeRecords([first, second, record('a1', 'u1', 'reply')]);
@@ -205,17 +236,17 @@ describe('SessionTranscriptReader', () => {
       Buffer.byteLength(JSON.stringify(first)) +
       Buffer.byteLength(JSON.stringify(second));
 
-    await expect(
-      new SessionTranscriptReader(workspaceDir).readPage(sessionId, {
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+      {
         limit: 1,
         maxBytes: aggregateBytes - 1,
-      }),
-    ).rejects.toMatchObject({
-      name: 'SessionTranscriptPageTooLargeError',
-      sessionId,
-      pageBytes: aggregateBytes,
-      maxBytes: aggregateBytes - 1,
-    } satisfies Partial<SessionTranscriptPageTooLargeError>);
+      },
+    );
+
+    // An indivisible record rides over budget rather than dead-ending the page.
+    expect(page.records.map((item) => item.uuid)).toEqual(['u1']);
+    expect(page.hasMore).toBe(true);
   });
 
   it('pages only the active parentUuid chain and skips abandoned branches', async () => {
@@ -241,6 +272,373 @@ describe('SessionTranscriptReader', () => {
     expect(second.records.map((r) => r.uuid)).toEqual(['u2-new', 'a2-new']);
     expect(second.hasMore).toBe(false);
     expect(second.nextCursorState).toBeUndefined();
+  });
+
+  it('pages backward before an exclusive active record boundary', async () => {
+    await writeRecords([
+      record('u1', null, 'first prompt'),
+      record('a1', 'u1', 'first answer'),
+      record('u2', 'a1', 'second prompt'),
+      record('a2', 'u2', 'second answer'),
+      record('u3', 'a2', 'third prompt'),
+      record('a3', 'u3', 'third answer'),
+    ]);
+
+    const reader = new SessionTranscriptReader(workspaceDir);
+    const first = await reader.readPage(sessionId, {
+      beforeRecordId: 'u3',
+      limit: 2,
+    });
+    const second = await reader.readPage(sessionId, {
+      beforeRecordId: first.records[0]!.uuid,
+      limit: 2,
+    });
+
+    expect(first.records.map((item) => item.uuid)).toEqual(['u2', 'a2']);
+    expect(first.direction).toBe('backward');
+    expect(first.hasMore).toBe(true);
+    expect(first.nextCursorState).toMatchObject({
+      position: 2,
+      direction: 'backward',
+    });
+    expect(second.records.map((item) => item.uuid)).toEqual(['u1', 'a1']);
+    expect(second.hasMore).toBe(false);
+  });
+
+  it('starts backward paging at the persisted tail', async () => {
+    await writeRecords([
+      record('u1', null, 'first prompt'),
+      record('a1', 'u1', 'first answer'),
+      record('u2', 'a1', 'second prompt'),
+      record('a2', 'u2', 'second answer'),
+    ]);
+
+    const reader = new SessionTranscriptReader(workspaceDir);
+    const page = await reader.readPage(sessionId, {
+      direction: 'backward',
+      limit: 2,
+    });
+
+    expect(page.records.map((item) => item.uuid)).toEqual(['u2', 'a2']);
+    expect(page.direction).toBe('backward');
+    expect(page.hasMore).toBe(true);
+    expect(page.nextCursorState).toMatchObject({
+      position: 2,
+      direction: 'backward',
+    });
+  });
+
+  it('seeds backward replay from the latest authoritative Goal state', async () => {
+    const goalState: ChatRecord = {
+      ...record('goal-state', null, 'ignored'),
+      type: 'system',
+      subtype: 'goal_state',
+      message: undefined,
+      systemPayload: {
+        v: 2,
+        cause: 'create',
+        snapshot: {
+          v: 2,
+          activity: 'idle',
+          goal: {
+            goalId: 'goal-1',
+            revision: 1,
+            objective: 'ship backward replay',
+            status: 'active',
+            evidenceCursor: { recordId: null },
+            turnCount: 0,
+            activeTimeMs: 0,
+            createdAt: 1,
+            updatedAt: 1,
+          },
+        },
+      },
+    };
+    const clearState: ChatRecord = {
+      ...record('goal-clear', 'u2', 'ignored'),
+      type: 'system',
+      subtype: 'goal_state',
+      message: undefined,
+      systemPayload: {
+        v: 2,
+        cause: 'clear',
+        snapshot: { v: 2, activity: 'idle', goal: null },
+      },
+    };
+    await writeRecords([
+      goalState,
+      record('u1', 'goal-state', 'first prompt'),
+      record('a1', 'u1', 'first answer'),
+      record('u2', 'a1', 'second prompt'),
+      clearState,
+      record('a2', 'goal-clear', 'second answer'),
+      record('u3', 'a2', 'third prompt'),
+    ]);
+
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+      { beforeRecordId: 'u3', limit: 2 },
+    );
+
+    expect(page.records.map((item) => item.uuid)).toEqual([
+      'u2',
+      'goal-clear',
+      'a2',
+    ]);
+    expect(page.replay).toMatchObject({
+      goalState: {
+        v: 2,
+        activity: 'idle',
+        goal: { objective: 'ship backward replay' },
+      },
+    });
+  });
+
+  it('does not revive older Goal state when the latest state is malformed', async () => {
+    const validGoalState: ChatRecord = {
+      ...record('goal-state', null, 'ignored'),
+      type: 'system',
+      subtype: 'goal_state',
+      message: undefined,
+      systemPayload: {
+        v: 2,
+        cause: 'create',
+        snapshot: {
+          v: 2,
+          activity: 'idle',
+          goal: {
+            goalId: 'goal-1',
+            revision: 1,
+            objective: 'do not revive me',
+            status: 'active',
+            evidenceCursor: { recordId: null },
+            turnCount: 0,
+            activeTimeMs: 0,
+            createdAt: 1,
+            updatedAt: 1,
+          },
+        },
+      },
+    };
+    const malformedGoalState: ChatRecord = {
+      ...record('goal-invalid', 'a1', 'ignored'),
+      type: 'system',
+      subtype: 'goal_state',
+      message: undefined,
+      systemPayload: {
+        v: 2,
+        cause: 'clear',
+        // Truthy but invalid: the parser only accepts `activity === 'idle'`,
+        // so a `running` snapshot must be rejected. A falsy `null` here would
+        // pass even with the validation deleted, leaving the guard untested.
+        snapshot: {
+          v: 2,
+          activity: 'running',
+          goal: {
+            goalId: 'goal-1',
+            revision: 1,
+            objective: 'do not revive me',
+            status: 'active',
+            evidenceCursor: { recordId: null },
+            turnCount: 0,
+            activeTimeMs: 0,
+            createdAt: 1,
+            updatedAt: 1,
+          },
+        },
+      } as unknown as ChatRecord['systemPayload'],
+    };
+    await writeRecords([
+      validGoalState,
+      record('u1', 'goal-state', 'first prompt'),
+      record('a1', 'u1', 'first answer'),
+      malformedGoalState,
+      record('u2', 'goal-invalid', 'second prompt'),
+      record('a2', 'u2', 'second answer'),
+      record('u3', 'a2', 'third prompt'),
+    ]);
+
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+      { beforeRecordId: 'u3', limit: 2 },
+    );
+
+    expect(page.records.map((item) => item.uuid)).toEqual(['u2', 'a2']);
+    expect(page.replay).toBeUndefined();
+  });
+
+  it('includes leading session metadata with the first backward page', async () => {
+    const sessionSource = {
+      ...record('source', null, 'session source'),
+      type: 'system' as const,
+      subtype: 'session_source' as const,
+    };
+    await writeRecords([
+      sessionSource,
+      record('u1', 'source', 'first prompt'),
+      record('a1', 'u1', 'first answer'),
+    ]);
+
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+      { direction: 'backward', limit: 100 },
+    );
+
+    expect(page.records.map((item) => item.uuid)).toEqual([
+      'source',
+      'u1',
+      'a1',
+    ]);
+    expect(page.hasMore).toBe(false);
+    expect(page.nextCursorState).toBeUndefined();
+  });
+
+  it('does not page into inherited side-task context', async () => {
+    const inheritedUser = {
+      ...record('parent-u1', 'source', 'parent prompt'),
+      forkedFrom: {
+        sessionId: 'parent-session',
+        messageUuid: 'parent-u1',
+      },
+    };
+    const inheritedAssistant = {
+      ...record('parent-a1', 'parent-u1', 'parent answer'),
+      forkedFrom: {
+        sessionId: 'parent-session',
+        messageUuid: 'parent-a1',
+      },
+    };
+    const sessionSource = {
+      ...record('source', null, 'session source'),
+      type: 'system' as const,
+      subtype: 'session_source' as const,
+      systemPayload: {
+        sourceType: 'side_task',
+        sourceId: 'parent-session',
+      },
+    };
+    await writeRecords([
+      sessionSource,
+      inheritedUser,
+      inheritedAssistant,
+      record('side-u1', 'parent-a1', 'side prompt'),
+      record('side-a1', 'side-u1', 'side answer'),
+    ]);
+
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+      { direction: 'backward', limit: 100 },
+    );
+
+    expect(page.records.map((item) => item.uuid)).toEqual([
+      'source',
+      'side-u1',
+      'side-a1',
+    ]);
+    expect(page.hasMore).toBe(false);
+  });
+
+  it('keeps backward pages within a normal user turn boundary', async () => {
+    const toolCall = record('a-tool', 'u1', 'call tool');
+    const toolResult = {
+      ...record('t1', 'a-tool', 'tool result'),
+      type: 'tool_result' as const,
+    };
+    await writeRecords([
+      record('u1', null, 'first prompt'),
+      toolCall,
+      toolResult,
+      record('a1', 't1', 'first answer'),
+      record('u2', 'a1', 'second prompt'),
+      record('a2', 'u2', 'second answer'),
+    ]);
+
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+      { beforeRecordId: 'u2', limit: 4 },
+    );
+
+    expect(page.records.map((item) => item.uuid)).toEqual([
+      'u1',
+      'a-tool',
+      't1',
+      'a1',
+    ]);
+  });
+
+  it('keeps a long user turn complete when it exceeds the record limit', async () => {
+    const toolCall = record('a-tool', 'u1', 'call tool');
+    const toolResult = {
+      ...record('t1', 'a-tool', 'tool result'),
+      type: 'tool_result' as const,
+    };
+    await writeRecords([
+      record('u1', null, 'prompt'),
+      toolCall,
+      toolResult,
+      record('a-final', 't1', 'final answer'),
+      record('u2', 'a-final', 'next prompt'),
+    ]);
+
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+      { beforeRecordId: 'u2', limit: 2 },
+    );
+
+    expect(page.records.map((item) => item.uuid)).toEqual([
+      'u1',
+      'a-tool',
+      't1',
+      'a-final',
+    ]);
+    expect(page.hasMore).toBe(false);
+  });
+
+  it('returns a backward turn that exceeds maxBytes after alignment', async () => {
+    const toolCall = record('a-tool', 'u1', 'call tool');
+    const toolResult = {
+      ...record('t1', 'a-tool', 'tool result'),
+      type: 'tool_result' as const,
+    };
+    const finalAnswer = record('a-final', 't1', 'final answer');
+    await writeRecords([
+      record('u1', null, 'prompt'),
+      toolCall,
+      toolResult,
+      finalAnswer,
+      record('u2', 'a-final', 'next prompt'),
+    ]);
+
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+      {
+        beforeRecordId: 'u2',
+        limit: 2,
+        maxBytes: Buffer.byteLength(JSON.stringify(finalAnswer)),
+      },
+    );
+
+    // The turn cannot be split across pages, so it rides over budget whole.
+    expect(page.records.map((item) => item.uuid)).toEqual([
+      'u1',
+      'a-tool',
+      't1',
+      'a-final',
+    ]);
+    expect(page.hasMore).toBe(false);
+  });
+
+  it('rejects a backward boundary outside the active chain', async () => {
+    await writeRecords([
+      record('u1', null, 'root'),
+      record('a1', 'u1', 'answer'),
+    ]);
+
+    await expect(
+      new SessionTranscriptReader(workspaceDir).readPage(sessionId, {
+        beforeRecordId: 'missing',
+      }),
+    ).rejects.toBeInstanceOf(InvalidSessionTranscriptCursorError);
   });
 
   it('continues a frozen snapshot after new records are appended', async () => {
@@ -341,6 +739,54 @@ describe('SessionTranscriptReader', () => {
         }),
       }),
     ).rejects.toBeInstanceOf(SessionTranscriptSnapshotUnavailableError);
+  });
+
+  it('accepts a file identity whose inode exceeds 2^53 (Windows file index)', async () => {
+    await writeRecords([
+      record('u1', null, 'root'),
+      record('a1', 'u1', 'assistant'),
+    ]);
+
+    const reader = new SessionTranscriptReader(workspaceDir);
+    const first = await reader.readPage(sessionId, { limit: 1 });
+    // Windows derives Stats.ino from a 64-bit file index that exceeds 2^53, so
+    // a safe-integer gate would reject every cursor there. The large inode must
+    // survive shape validation and reach the identity match (which then fails
+    // against the real file), rather than being rejected as a non-safe integer.
+    const bigIno = 2 ** 53 + 2;
+    expect(Number.isSafeInteger(bigIno)).toBe(false);
+
+    await expect(
+      reader.readPage(sessionId, {
+        cursor: encodeCursor({
+          ...first.nextCursorState!,
+          fileIdentity: { dev: 1, ino: bigIno },
+        }),
+      }),
+    ).rejects.toBeInstanceOf(SessionTranscriptSnapshotUnavailableError);
+  });
+
+  it('still rejects a non-safe-integer byte offset in a cursor', async () => {
+    await writeRecords([
+      record('u1', null, 'root'),
+      record('a1', 'u1', 'assistant'),
+    ]);
+
+    const reader = new SessionTranscriptReader(workspaceDir);
+    const first = await reader.readPage(sessionId, { limit: 1 });
+    // snapshotSize/position are arithmetic operands and stay safe-integer even
+    // though dev/ino were relaxed for Windows.
+    const unsafeOffset = 2 ** 53 + 2;
+    expect(Number.isSafeInteger(unsafeOffset)).toBe(false);
+
+    await expect(
+      reader.readPage(sessionId, {
+        cursor: encodeCursor({
+          ...first.nextCursorState!,
+          snapshotSize: unsafeOffset,
+        }),
+      }),
+    ).rejects.toBeInstanceOf(InvalidSessionTranscriptCursorError);
   });
 
   it('rejects cursors whose position is past the active chain', async () => {
@@ -572,12 +1018,15 @@ describe('SessionTranscriptReader', () => {
       `${gluedLine}\n${JSON.stringify(record('a1', 'u1', 'reply'))}\n`,
     );
 
-    await expect(
-      new SessionTranscriptReader(workspaceDir).readPage(sessionId, {
-        limit: 1,
-        maxBytes: Buffer.byteLength(gluedLine) * 2 - 1,
-      }),
-    ).rejects.toBeInstanceOf(SessionTranscriptPageTooLargeError);
+    const page = await new SessionTranscriptReader(workspaceDir).readPage(
+      sessionId,
+      { limit: 2, maxBytes: Buffer.byteLength(gluedLine) * 2 },
+    );
+
+    // Conservative per-fragment counting spends the whole budget on the glued
+    // aggregate, so the next record must wait for the following page.
+    expect(page.records.map((item) => item.uuid)).toEqual(['u1']);
+    expect(page.hasMore).toBe(true);
   });
 
   it('skips non-ChatRecord JSON lines while indexing', async () => {
@@ -792,5 +1241,62 @@ describe('SessionTranscriptReader', () => {
         (r) => r.uuid,
       ),
     ).toEqual(['33333333', '44444444']);
+  });
+
+  describe('boundary and turn-start edge cases', () => {
+    it('makes exact turn-boundary cuts when limit aligns perfectly', async () => {
+      await writeRecords([
+        record('u1', null, 'first prompt'),
+        record('a1', 'u1', 'first answer'),
+        record('u2', 'a1', 'second prompt'),
+        record('a2', 'u2', 'second answer'),
+      ]);
+
+      const reader = new SessionTranscriptReader(workspaceDir);
+      const first = await reader.readPage(sessionId, {
+        beforeRecordId: 'u2',
+        limit: 2,
+      });
+
+      expect(first.records.map((item) => item.uuid)).toEqual(['u1', 'a1']);
+      expect(first.hasMore).toBe(false);
+      expect(first.nextCursorState).toBeUndefined();
+    });
+
+    it('discovers backward boundary when beforeRecordId is an assistant record', async () => {
+      await writeRecords([
+        record('u1', null, 'first prompt'),
+        record('a1', 'u1', 'first answer'),
+        record('u2', 'a1', 'second prompt'),
+        record('a2', 'u2', 'second answer'),
+      ]);
+
+      const reader = new SessionTranscriptReader(workspaceDir);
+      const page = await reader.readPage(sessionId, {
+        beforeRecordId: 'a2',
+        limit: 2,
+      });
+
+      expect(page.records.map((item) => item.uuid)).toEqual(['u2']);
+      expect(page.direction).toBe('backward');
+      expect(page.hasMore).toBe(true);
+    });
+
+    it('pages backward through records without a normal user turn start', async () => {
+      await writeRecords([
+        record('a1', null, 'orphan assistant reply'),
+        record('u1', 'a1', 'second prompt'),
+        record('a2', 'u1', 'second answer'),
+      ]);
+
+      const reader = new SessionTranscriptReader(workspaceDir);
+      const page = await reader.readPage(sessionId, {
+        beforeRecordId: 'u1',
+        limit: 5,
+      });
+
+      expect(page.records.map((item) => item.uuid)).toEqual(['a1']);
+      expect(page.hasMore).toBe(false);
+    });
   });
 });

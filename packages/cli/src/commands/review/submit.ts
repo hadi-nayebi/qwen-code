@@ -24,34 +24,63 @@
 //
 // So the write lives here, behind that fact. A model that wants to post must ask
 // something that checks.
+//
+// **And the verdict is no longer an input.** For a while, `compose-review`
+// computed the event and the body and the skill then told the orchestrator to
+// "copy event/body verbatim into the review JSON" — a transcription, into a
+// document the model writes, of a decision the CLI had already made. That is the
+// exact shape this file's own comment repudiates two paragraphs up, and it is the
+// shape that has failed at every layer of this skill. Dogfooded, one run went
+// further and skipped `compose-review` altogether: it read the coverage check's
+// refusal, decided "the agents clearly did their job", and printed an **Approve it
+// had written itself**.
+//
+// So `submit` composes. What it takes is the *findings* — the inline comments and
+// the states Step 6 established — and it derives everything that follows from
+// them, including how many blockers there are, by counting the comments actually
+// attached rather than believing a number typed beside them. There is no `event`
+// field to forge and no `body` field to write, and a payload that carries one is
+// refused: the caller was trying to author a verdict, and the verdict is not the
+// caller's.
 
 import type { CommandModule } from 'yargs';
-import { readFileSync } from 'node:fs';
+import { atomicWriteFileSync } from '@qwen-code/qwen-code-core';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { writeStdoutLine, writeStderrLine } from '../../utils/stdioHelpers.js';
+import { getCliVersion } from '../../utils/version.js';
 import { ghWithInput, setGhHost } from './lib/gh.js';
-import { parseReviewArgs } from './parse-args.js';
+import { REVIEW_TMP_DIR, tmpFile } from './lib/paths.js';
+import { parseReceiptIds } from './lib/receipt.js';
+import { composeReview, type ComposeReviewInput } from './compose-review.js';
+import { reviewWriteAuthorization } from './lib/authorization.js';
 import {
-  skillArgsPath,
-  currentSessionId,
-} from '../../services/skill-args-file.js';
-
-/**
- * Where the CLI records a skill's invocation arguments, verbatim, before the
- * skill's prompt reaches the model.
- *
- * Derived, not duplicated. A literal here would say "kept in step with
- * `skill-args-file.ts`" and nothing would keep it: rename the file there and the
- * gate silently stops finding the authorisation and refuses every post.
- */
-// Derived from the session id at call time, not a constant: the args file is
-// named for the session that wrote it, and `submit` (a subprocess of that
-// session) reads the same name from the same inherited `QWEN_CODE_SESSION_ID`.
-function defaultSkillArgsPath(): string {
-  return skillArgsPath('review');
-}
+  CRITICAL_PREFIX,
+  SUGGESTION_PREFIX,
+  countInlineFindings,
+  severityOf,
+} from './lib/inline-counts.js';
+import {
+  REVIEW_FOOTER_RE,
+  footerVersion,
+  reviewFooter,
+} from './lib/review-footer.js';
 
 /** The only events GitHub's Create Review API accepts. */
 const EVENTS = new Set(['APPROVE', 'REQUEST_CHANGES', 'COMMENT']);
+
+/**
+ * Review ids a prior submit in this window already recorded. Best-effort: an
+ * absent or unreadable receipt is an empty list, never a throw — the caller
+ * adds the current id regardless. The shape parse is shared with cleanup's
+ * reader (`lib/receipt.ts`) so the two halves cannot drift.
+ */
+function readReceiptIds(receiptPath: string): number[] {
+  try {
+    return parseReceiptIds(readFileSync(receiptPath, 'utf8'));
+  } catch {
+    return [];
+  }
+}
 
 /**
  * A line number GitHub will take: a positive whole number.
@@ -75,131 +104,79 @@ interface SubmitArgs {
   dryRun: boolean;
 }
 
+interface ReviewComment {
+  path?: string;
+  line?: number;
+  start_line?: number;
+  side?: string;
+  start_side?: string;
+  body?: string;
+}
+
+/**
+ * What the caller brings: the findings, and the states Step 6 established.
+ *
+ * Not the verdict. `event` and `body` are computed here, from `state` and from the
+ * comments themselves — see the file header.
+ */
 interface ReviewPayload {
   commit_id?: string;
-  event?: string;
-  body?: string;
-  comments?: Array<{
-    path?: string;
-    line?: number;
-    start_line?: number;
-    side?: string;
-    start_side?: string;
-    body?: string;
-  }>;
+  comments?: ReviewComment[];
+  state?: ComposeReviewInput;
+  /** Refused if present. The caller was trying to author the verdict. */
+  event?: unknown;
+  body?: unknown;
 }
+
+function normalizeInlineComments(
+  comments: ReviewComment[],
+  modelId: unknown,
+  cliVersion: string,
+): ReviewComment[] {
+  if (typeof modelId !== 'string' || modelId.trim() === '') return comments;
+  const footer = reviewFooter(modelId, cliVersion);
+  return comments.map((comment) =>
+    // An empty body stays empty: this runs BEFORE the consistency check, and
+    // a footer pasted onto '' would hide the emptiness from the refusal that
+    // names it ('has no body — an empty comment').
+    typeof comment.body === 'string' && comment.body.trim() !== ''
+      ? {
+          ...comment,
+          body: `${comment.body.replace(REVIEW_FOOTER_RE, '')}\n\n${footer}`,
+        }
+      : comment,
+  );
+}
+
+// The severity prefixes and the counting live in `lib/inline-counts.ts`,
+// shared with `compose-review`: the Step 6 verdict line and the Step 7 posted
+// verdict must be the same computation on the same source, and two counting
+// functions is how they were once allowed to disagree.
 
 /**
  * Was this run authorised to write to the pull request?
  *
- * Exactly two things authorise it, and both are facts rather than impressions:
- * `--comment` in the arguments the user typed (which `parse-args` resolved into
- * `comment.effective`), or `--user-authorized`, which the skill may pass only
- * after the user asked for this review to be published in a message they typed
- * this session.
+ * The gate itself lives in `lib/authorization.ts`, shared verbatim with
+ * `publish-assets` — the only other sanctioned public write. See that file for
+ * why authorisation is re-parsed from the CLI's verbatim record of what the
+ * user typed, and why it binds to a target rather than acting as a bearer
+ * token.
  */
 function authorization(args: SubmitArgs): { ok: boolean; why: string } {
-  if (args.userAuthorized) {
-    return { ok: true, why: 'the user asked for this review to be published' };
-  }
-
-  // Read what the **user typed**, and parse it here.
-  //
-  // The obvious design — take the parser's JSON verdict and read
-  // `comment.effective` out of it — hands the gate a document the caller wrote.
-  // A model that wants to post can write `{"comment":{"effective":true}}` to any
-  // file and point at it, and the gate opens. It is not a hypothetical: this
-  // exact weakness was raised by a review of this very change, and confirmed
-  // against the built CLI in one line.
-  //
-  // The argument string is different in kind. The CLI writes it, verbatim,
-  // before the skill's prompt ever reaches the model — nothing between the user's
-  // keystrokes and this file has an opinion. So the gate reads *that*, and runs
-  // the same tested parser on it. Forging authorisation now means forging the
-  // user's own input, which is not something a careless run does by accident.
-  // The session-scoped path is derived here, from the environment, on both the
-  // write and read sides — the model never names it. `--skill-args` is a test
-  // seam only (there is no session id under vitest); honouring a caller-supplied
-  // path in a real run would hand the gate back the model-writable file the whole
-  // design removed, so it is ignored whenever a session id is present.
-  const sessionScoped = defaultSkillArgsPath();
-  const path =
-    currentSessionId() === '' && args.skillArgs
-      ? args.skillArgs
-      : sessionScoped;
-  let raw: string;
-  try {
-    raw = readFileSync(path, 'utf8');
-  } catch {
-    // No args file means no arguments — which means no `--comment`. Fail closed:
-    // a missing authorisation record is not an absent objection.
-    return {
-      ok: false,
-      why:
-        `no review arguments were recorded at ${path}, so this run cannot ` +
-        'show that `--comment` was requested',
-    };
-  }
-
-  const verdict = parseReviewArgs(raw);
-  if (!verdict.comment.effective) {
-    return {
-      ok: false,
-      why:
-        '`--comment` was not in the review arguments ' +
-        `(${JSON.stringify(raw.trim())})`,
-    };
-  }
-
-  // Authorisation is for a *target*, not a mood. `/review 6771 --comment`
-  // authorises a write to pull request 6771 — and to nothing else. Without this
-  // check the flag is a bearer token: a dry run confirmed that arguments naming
-  // 6771 happily authorised a submission to `--pr 9999 --repo other/repo`, so a
-  // stale args file, or a target swapped anywhere between Step 1 and Step 7,
-  // could put a review on a pull request the user never named.
-  const t = verdict.target;
-  const authorisedPr =
-    t.type === 'pr-number' || t.type === 'pr-url' ? t.number : undefined;
-  if (authorisedPr === undefined) {
-    return {
-      ok: false,
-      why:
-        `the review arguments (${JSON.stringify(raw.trim())}) do not name a ` +
-        'pull request, so they cannot authorise posting to one',
-    };
-  }
-  if (authorisedPr !== args.pr) {
-    return {
-      ok: false,
-      why:
-        `the review arguments authorise pull request #${authorisedPr}, but ` +
-        `this submission targets #${args.pr}`,
-    };
-  }
-  if (t.type === 'pr-url') {
-    const authorisedRepo = `${t.owner}/${t.repo}`;
-    if (authorisedRepo.toLowerCase() !== args.repo.toLowerCase()) {
-      return {
-        ok: false,
-        why:
-          `the review arguments authorise ${authorisedRepo}, but this ` +
-          `submission targets ${args.repo}`,
-      };
-    }
-    if (args.host && t.host.toLowerCase() !== args.host.toLowerCase()) {
-      return {
-        ok: false,
-        why:
-          `the review arguments authorise ${t.host}, but this submission ` +
-          `targets ${args.host}`,
-      };
-    }
-  }
-
-  return {
-    ok: true,
-    why: `\`--comment\` was in the review arguments for #${authorisedPr}`,
-  };
+  return reviewWriteAuthorization({
+    userAuthorized: args.userAuthorized,
+    skillArgs: args.skillArgs,
+    pr: args.pr,
+    repo: args.repo,
+    // The EFFECTIVE host, not merely the flag: with --host absent the gh
+    // child inherits an operator-exported GH_HOST, so that is where this
+    // write would route — and what the gate must bind. Same resolution as
+    // publish-assets.
+    // `|| undefined`, not `??`: an exported-but-empty GH_HOST ("" survives
+    // `??`, being non-nullish) must read as "no host", not as a host named
+    // "" that fails every comparison.
+    host: args.host ?? (process.env['GH_HOST']?.trim() || undefined),
+  });
 }
 
 /**
@@ -211,56 +188,135 @@ function authorization(args: SubmitArgs): { ok: boolean; why: string } {
  * disagreed with every other. GitHub accepts all of it — none of it is invalid
  * to the API — so the only place it can be caught is here.
  */
-function inconsistencies(payload: ReviewPayload): string[] {
+/**
+ * The verdict, computed — from the states the caller established and the comments
+ * it actually attached.
+ *
+ * The two inline counts are **derived, not accepted**. They used to be numbers
+ * handed over beside the comments, and a number beside a thing is a number that can
+ * disagree with it.
+ */
+function compose(
+  payload: ReviewPayload,
+  cliVersion: string,
+): {
+  event: string;
+  body: string;
+  cappedBy: string[];
+} {
+  const comments = payload.comments ?? [];
+  const state = payload.state ?? ({} as ComposeReviewInput);
+  const { criticalsInline, suggestionsInline } = countInlineFindings(comments);
+
+  // `env` decides where the harness transcripts are read from, and it must not
+  // come from a JSON the caller wrote: a run that wanted an approval could point
+  // it at a directory of transcripts it fabricated, and the coverage gate reopens
+  // through one extra key. `prBodyFetcher` is the bilingual body-language seam:
+  // a non-function value reaching `bilingualFromPlan` throws and drops the Chinese
+  // fold through the fail-safe — the exact regression this PR closes. compose-review's
+  // own CLI strips both for the same reason.
+  // `draftedComments` joins them: the ledger marker's contents are the comments
+  // this submission actually carries, taken from the payload below — not an
+  // assertion a caller's state JSON gets to make about what it reviewed.
+  const {
+    env: _dropped,
+    prBodyFetcher: _droppedFetcher,
+    draftedComments: _droppedDrafted,
+    ...rest
+  } = state;
+  void _dropped;
+  void _droppedFetcher;
+  void _droppedDrafted;
+
+  const r = composeReview(
+    {
+      ...rest,
+      criticalsInline,
+      suggestionsInline,
+      draftedComments: comments,
+    },
+    cliVersion,
+  );
+  return { event: r.event, body: r.body, cappedBy: r.cappedBy };
+}
+
+/** What the caller may not bring. Checked before the verdict is computed from it. */
+function structuralProblems(payload: ReviewPayload): string[] {
+  const problems: string[] = [];
+
+  if (!payload.commit_id) problems.push('`commit_id` is missing');
+
+  // The review JSON is a document the model writes, and `comments` reaches
+  // `.map` in the normalisation below — OUTSIDE `compose`'s try/catch. Any
+  // other shape is refused here as the structured refusal the re-compose
+  // loop parses, not a bare TypeError.
+  if (payload.comments !== undefined && !Array.isArray(payload.comments)) {
+    problems.push(
+      '`comments` is not an array — it is the list of findings this post ' +
+        'carries; any other shape is not a list of findings.',
+    );
+  }
+  if (
+    Array.isArray(payload.comments) &&
+    (payload.comments as unknown[]).some(
+      (c) => c === null || typeof c !== 'object',
+    )
+  ) {
+    problems.push(
+      '`comments` entries must each be an object — a finding is a path, ' +
+        'a line and a body; any other shape is not a finding.',
+    );
+  }
+
+  // The verdict is not the caller's to write. Refusing is deliberate: silently
+  // ignoring a hand-written `event` would let a run believe it had posted the
+  // verdict it typed, and go on saying so in the terminal.
+  if (payload.event !== undefined || payload.body !== undefined) {
+    problems.push(
+      'the payload carries `event`/`body`. Those are computed here, from ' +
+        '`state` and from the comments you attached — they are not inputs. ' +
+        'Remove them. (A run that skipped `compose-review` and typed its own ' +
+        'Approve is exactly what this refuses.)',
+    );
+  }
+  // `== null`, not `=== undefined`. A payload with `"state": null` cleared the
+  // strict check, and `compose`'s `?? {}` then collapsed it to an empty state —
+  // which composes into a review whose footer names no model and whose caps come
+  // from nowhere. The verdict would still have been posted.
+  if (payload.state == null) {
+    problems.push(
+      '`state` is missing — the verdict is computed from it. It is the same ' +
+        'object `compose-review` takes: the body Criticals, the discarded ' +
+        'suggestions, the cannot-tell blockers, the unreviewed dimensions, the ' +
+        '`planPath`, the presubmit flags and the model id.',
+    );
+  }
+  if (
+    payload.state?.criticalsInline !== undefined ||
+    payload.state?.suggestionsInline !== undefined
+  ) {
+    problems.push(
+      '`state.criticalsInline` / `state.suggestionsInline` are counted from the ' +
+        '`comments` you attached, not taken from you. Remove them.',
+    );
+  }
+  return problems;
+}
+
+function inconsistencies(payload: ReviewPayload, event: string): string[] {
   const problems: string[] = [];
   const comments = payload.comments ?? [];
 
-  if (!payload.commit_id) problems.push('`commit_id` is missing');
-  if (!payload.event) problems.push('`event` is missing');
-  else if (!EVENTS.has(payload.event)) {
+  if (!EVENTS.has(event)) {
+    // Unreachable through `composeReview`, which returns one of the three. Kept
+    // because "unreachable" is a claim about today's code, and this is the last
+    // thing standing between a bad payload and a public write.
     problems.push(
-      `\`event\` is ${JSON.stringify(payload.event)}; GitHub accepts only ` +
+      `computed \`event\` is ${JSON.stringify(event)}; GitHub accepts only ` +
         `${[...EVENTS].join(', ')}`,
     );
   }
 
-  // The exact sentence `compose-review` writes when it puts findings inline —
-  // not the word "inline" anywhere in the body. A body IS finding text: an
-  // unmappable Critical reading "the inline cache is stale" is a real blocker,
-  // and a `/\binline\b/` search refuses to post it. The check exists to catch a
-  // body that *promises* comments it did not bring, so look for the promise.
-  const promisesInline = /\b(are|is) inline\b/i.test(payload.body ?? '');
-  if (promisesInline && comments.length === 0) {
-    problems.push(
-      'the body says findings are inline, but `comments` is empty — the ' +
-        'author would be told to look for comments that do not exist',
-    );
-  }
-  if (payload.event === 'COMMENT' && !payload.body && comments.length === 0) {
-    problems.push(
-      'a COMMENT event with no body and no comments is rejected by GitHub and ' +
-        'would lose the review entirely',
-    );
-  }
-  // The escaped footer, which is the fingerprint of a body built by shell string
-  // interpolation (`-f body=...`) instead of written as JSON: the newlines before
-  // `_— <model> via Qwen Code /review_` arrive as the two literal characters
-  // backslash-n and the footer lands mid-sentence. The breaching dogfood run
-  // posted exactly this.
-  //
-  // Deliberately not a bare search for `\n` anywhere in the body. A body may
-  // legitimately carry one — an unmappable Critical whose description quotes a
-  // regex (`/\n/`) or an escaped string is exactly the finding text this field
-  // exists to hold — and a false positive here does not warn, it **refuses the
-  // post**, which loses a review that had a real blocker in it. Match the bug's
-  // actual signature, not a character that resembles it.
-  if (/\\n\s*(\\n)?\s*_—/.test(payload.body ?? '')) {
-    problems.push(
-      'the footer is preceded by a literal `\\n` — the body was built with ' +
-        '`-f body=` (or another shell interpolation) instead of written as ' +
-        'JSON, so its newlines will be posted as text',
-    );
-  }
   // Everything below is a shape GitHub 422s — and a 422 is all-or-nothing, so
   // each of these discards every blocker in the review along with itself. The
   // API is the wrong place to find out.
@@ -268,6 +324,20 @@ function inconsistencies(payload: ReviewPayload): string[] {
     const at = `comments[${i}]`;
     if (!c.path) problems.push(`${at} has no \`path\``);
     if (!c.body) problems.push(`${at} has no \`body\` — an empty comment`);
+
+    // The verdict above was counted from these markers, so a body carrying
+    // neither weighed nothing in it. Step 6 already refuses unmarked drafts,
+    // but the skill's own re-compose instruction expects the comment set to
+    // churn after Step 6 — and a marker lost in that churn reaches exactly
+    // this boundary, the one that posts. A blocker that weighs nothing
+    // approves the review it should block.
+    if (c.body && severityOf(c) === null) {
+      problems.push(
+        `${at} opens with neither ${CRITICAL_PREFIX} nor ` +
+          `${SUGGESTION_PREFIX} — the verdict counts comments by their ` +
+          `severity marker, and an unmarked one weighs nothing in it`,
+      );
+    }
 
     if (!isDiffLine(c.line)) {
       problems.push(
@@ -318,7 +388,7 @@ function isRepo(repo: string): boolean {
   );
 }
 
-export function runSubmit(args: SubmitArgs): void {
+export function runSubmit(args: SubmitArgs, cliVersion = 'unknown'): void {
   setGhHost(args.host);
 
   // The repo goes straight into the API path. A malformed value does not fail
@@ -366,13 +436,55 @@ export function runSubmit(args: SubmitArgs): void {
     return;
   }
 
-  const problems = inconsistencies(payload);
+  // What the caller may not bring, checked before anything is computed from it: a
+  // verdict of its own, or no state to compute one from. "Your state does not
+  // compose" is a poor way to say "you gave me no state".
+  const structural = structuralProblems(payload);
+  if (structural.length > 0) {
+    throw new Error(
+      `The review payload contradicts itself; refusing to post it:\n` +
+        structural.map((p) => `  - ${p}`).join('\n'),
+    );
+  }
+
+  payload = {
+    ...payload,
+    comments: normalizeInlineComments(
+      payload.comments ?? [],
+      payload.state?.modelId,
+      cliVersion,
+    ),
+  };
+
+  // The verdict, computed here. It was never in the payload.
+  let event: string;
+  let body: string;
+  let cappedBy: string[];
+  try {
+    ({ event, body, cappedBy } = compose(payload, cliVersion));
+  } catch (err) {
+    throw new Error(
+      `The review state does not compose into a verdict; refusing to post:\n` +
+        `  - ${(err as Error).message}`,
+    );
+  }
+
+  const problems = inconsistencies(payload, event);
   if (problems.length > 0) {
     throw new Error(
       `The review payload contradicts itself; refusing to post it:\n` +
         problems.map((p) => `  - ${p}`).join('\n'),
     );
   }
+
+  // What GitHub actually receives: the caller's findings, under the verdict this
+  // command computed. `event` and `body` were never in the object the caller wrote.
+  const post = {
+    commit_id: payload.commit_id,
+    event,
+    body,
+    comments: payload.comments ?? [],
+  };
 
   const target = `repos/${args.repo}/pulls/${args.pr}/reviews`;
   if (args.dryRun) {
@@ -382,7 +494,7 @@ export function runSubmit(args: SubmitArgs): void {
     );
     writeStdoutLine(
       JSON.stringify(
-        { posted: false, wouldPost: true, target, event: payload.event },
+        { posted: false, wouldPost: true, target, event, cappedBy },
         null,
         2,
       ),
@@ -396,16 +508,53 @@ export function runSubmit(args: SubmitArgs): void {
   // GitHub would receive a payload that never passed the gate. `--input -` posts
   // exactly the object we parsed and checked. (Still `--input`, never `-f body=`,
   // so the body's newlines reach GitHub as newlines.)
-  ghWithInput(JSON.stringify(payload), 'api', target, '--input', '-');
+  const response = ghWithInput(
+    JSON.stringify(post),
+    'api',
+    target,
+    '--input',
+    '-',
+  );
+  // Receipt for cleanup's bypass audit: EVERY review this session was
+  // authorised to create, by id. The audit lists reviews by the reviewing
+  // account inside the window and flags any the receipt does not vouch for —
+  // without the id, a bypass posted through `gh pr review` (a review, not an
+  // issue comment) would be indistinguishable from the sanctioned one.
+  //
+  // The receipt ACCUMULATES ids rather than overwriting: the audit window
+  // spans drift restarts (fetch-pr preserves `auditSince`), so two sanctioned
+  // submits can fall in one window. A single-id receipt vouched only for the
+  // last, and the earlier legitimate review was then flagged as a bypass —
+  // a false positive for a write submit itself made. So read the prior ids,
+  // add this one, dedupe, write back. Best-effort: a receipt failure must
+  // never fail a review that DID post.
+  try {
+    const reviewId = (JSON.parse(response) as { id?: number }).id;
+    if (typeof reviewId === 'number') {
+      const receiptPath = tmpFile(`pr-${args.pr}`, 'submit-receipt.json');
+      const priorIds = readReceiptIds(receiptPath);
+      const reviewIds = [...new Set([...priorIds, reviewId])];
+      mkdirSync(REVIEW_TMP_DIR, { recursive: true });
+      atomicWriteFileSync(
+        receiptPath,
+        `${JSON.stringify({ reviewIds, event, postedAt: new Date().toISOString() })}\n`,
+      );
+    }
+  } catch {
+    /* audit metadata only — the post itself succeeded */
+  }
   writeStderrLine(
-    `Posted ${payload.event} to ${args.repo}#${args.pr} — ${auth.why}.`,
+    `Posted ${event} to ${args.repo}#${args.pr} — ${auth.why}` +
+      (cappedBy.length ? ` (capped by ${cappedBy.join(', ')})` : '') +
+      '.',
   );
   writeStdoutLine(
     JSON.stringify(
       {
         posted: true,
-        event: payload.event,
-        inlineComments: (payload.comments ?? []).length,
+        event,
+        cappedBy,
+        inlineComments: post.comments.length,
       },
       null,
       2,
@@ -433,7 +582,7 @@ export const submitCommand: CommandModule = {
         type: 'string',
         demandOption: true,
         describe:
-          'Path to the review JSON (commit_id / event / body / comments), as composed by `compose-review`',
+          'Path to the review JSON (commit_id / comments / state). event and body are computed here from state and the comments — do not include them.',
       })
       .option('skill-args', {
         type: 'string',
@@ -455,7 +604,11 @@ export const submitCommand: CommandModule = {
         default: false,
         describe: 'Check authorisation and payload consistency, then stop.',
       }),
-  handler: (argv) => {
-    runSubmit(argv as unknown as SubmitArgs);
+  handler: async (argv) => {
+    // Do not use CLI_VERSION here: esbuild replaces it with a build-time value.
+    const cliVersion =
+      footerVersion(process.env['QWEN_CODE_STARTUP_VERSION']) ??
+      (await getCliVersion());
+    runSubmit(argv as unknown as SubmitArgs, cliVersion);
   },
 };

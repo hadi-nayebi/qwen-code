@@ -8,14 +8,13 @@ import { type Config } from '../config/config.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import {
-  type PartListUnion,
-  type Content,
-  type FunctionDeclaration,
-  type GenerateContentResponseUsageMetadata,
-  createUserContent,
-  createModelContent,
+import type {
+  PartListUnion,
+  Content,
+  FunctionDeclaration,
+  GenerateContentResponseUsageMetadata,
 } from '@google/genai';
+import { createModelContent, createUserContent } from '../core/genai-compat.js';
 import * as jsonl from '../utils/jsonl-utils.js';
 import { getGitBranch } from '../utils/gitUtils.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
@@ -38,6 +37,17 @@ import type {
   SessionArtifactEventRecordPayload,
   SessionArtifactSnapshotRecordPayload,
 } from './session-artifact-persistence.js';
+import {
+  SessionTranscriptChangedError,
+  SessionWriterLostError,
+  SessionWriterUnavailableError,
+  type SessionWriterLease,
+} from './session-writer-lease.js';
+import type {
+  GoalStateRecordPayloadV2,
+  GoalTurnPermit,
+  TranscriptCursor,
+} from '../goals/goal-protocol.js';
 
 const debugLogger = createDebugLogger('CHAT_RECORDING');
 
@@ -226,6 +236,32 @@ function autoTitleDisabledByEnv(): boolean {
  * - Tree reconstruction by following parentUuid chain
  * - Future conversation branching by forking from any historical record
  */
+export type ChatRecordProvenance =
+  | 'real_user'
+  | 'assistant_output'
+  | 'tool_result'
+  | 'goal_control'
+  | 'goal_runtime'
+  | 'system';
+
+export type RecordToolResultOptions =
+  | {
+      goalContext?: GoalTurnPermit;
+      provenance?: 'tool_result';
+    }
+  | {
+      goalContext: GoalTurnPermit;
+      provenance: 'goal_runtime';
+    };
+
+function copyGoalContext(goalContext: GoalTurnPermit): GoalTurnPermit {
+  return {
+    goalId: goalContext.goalId,
+    revision: goalContext.revision,
+    turnId: goalContext.turnId,
+  };
+}
+
 export interface ChatRecord {
   /** Unique identifier for this logical message */
   uuid: string;
@@ -253,12 +289,21 @@ export interface ChatRecord {
     | 'mid_turn_user_message'
     | 'custom_title'
     | 'parent_session'
+    | 'session_source'
     | 'rewind'
     | 'agent_bootstrap'
     | 'agent_launch_prompt'
     | 'file_history_snapshot'
+    | 'user_text_elements'
     | 'session_artifact_event'
-    | 'session_artifact_snapshot';
+    | 'session_artifact_snapshot'
+    | 'goal_state'
+    | 'goal_runtime'
+    | 'realtime_message';
+  /** Explicit source classification used by Goal evidence validation. */
+  provenance?: ChatRecordProvenance;
+  /** Goal identity and logical turn that owned this model-facing record. */
+  goalContext?: GoalTurnPermit;
   /** Working directory at time of message */
   cwd: string;
   /** CLI version for compatibility tracking */
@@ -288,7 +333,7 @@ export interface ChatRecord {
    * Tool call metadata for UI recovery.
    * Contains enriched info (displayName, status, result, etc.) not in API format.
    */
-  toolCallResult?: Partial<ToolCallResponseInfo>;
+  toolCallResult?: Partial<ToolCallResponseInfo> & { status?: Status };
 
   /**
    * Payload for records that need non-API metadata. For chat compression, this
@@ -303,12 +348,16 @@ export interface ChatRecord {
     | AttributionSnapshotPayload
     | CustomTitleRecordPayload
     | ParentSessionRecordPayload
+    | SessionSourceRecordPayload
     | NotificationRecordPayload
+    | UserPromptRecordPayload
     | RewindRecordPayload
     | AgentBootstrapRecordPayload
     | FileHistorySnapshotRecordPayload
+    | UserTextElementsRecordPayload
     | SessionArtifactEventRecordPayload
-    | SessionArtifactSnapshotRecordPayload;
+    | SessionArtifactSnapshotRecordPayload
+    | GoalStateRecordPayloadV2;
 
   /** Background subagent that produced this record (e.g. "explore-7f3c"). */
   agentId?: string;
@@ -318,6 +367,10 @@ export interface ChatRecord {
   agentColor?: string;
   /** True for records produced by a subagent (a sidechain off the parent session). */
   isSidechain?: boolean;
+  /** Writer execution that produced this subagent round. */
+  agentRunId?: string;
+  /** Round number within agentRunId. */
+  agentRound?: number;
   /** Source kind for injected external input records. */
   externalInputKind?: 'message' | 'notification';
 
@@ -340,8 +393,27 @@ export interface ChatRecord {
   };
 }
 
+/**
+ * Stored payload for user-prompt records whose model-bound parts were
+ * augmented by a UserPromptSubmit hook. `message` keeps the exact
+ * model-bound Content (resume must replay what the model actually saw);
+ * this payload preserves the user-authored projection for UI/resume
+ * display. Hook-injected text stays recoverable from the tagged part in
+ * `message.parts` via `isUserPromptSubmitContextPartText`.
+ */
+export interface UserPromptRecordPayload {
+  /** Pre-injection projection of the user's own prompt text. */
+  displayText?: string;
+}
+
 export interface NotificationRecordPayload {
   displayText: string;
+  backgroundTask?: {
+    taskId: string;
+    status: string;
+    kind: 'agent' | 'monitor' | 'shell';
+    toolUseId?: string;
+  };
 }
 
 export interface AgentBootstrapRecordPayload {
@@ -354,13 +426,13 @@ export interface AgentBootstrapRecordPayload {
    */
   history: Content[];
   /**
-   * Immutable launch-time system instruction for the fork runtime. Resume must
-   * reuse this exact value rather than reading the current parent config.
+   * Legacy launch-time system instruction. Current writers omit this field and
+   * resume reconstructs the instruction from the current parent runtime.
    */
   systemInstruction?: string | Content;
   /**
-   * Immutable launch-time tool declarations / allowlist for the fork runtime.
-   * Resume must reuse this exact capability set or stay blocked.
+   * Legacy launch-time tool declarations / allowlist. Current writers omit
+   * this field and resume resolves tool names through the current registry.
    */
   tools?: Array<string | FunctionDeclaration>;
 }
@@ -443,6 +515,12 @@ export interface ParentSessionRecordPayload {
   parentSessionId: string;
 }
 
+/** Immutable attribution describing which integration created the session. */
+export interface SessionSourceRecordPayload {
+  sourceType: string;
+  sourceId?: string;
+}
+
 /**
  * Stored payload for UI telemetry replay.
  */
@@ -472,6 +550,11 @@ export interface RewindRecordPayload {
  */
 export interface FileHistorySnapshotRecordPayload {
   snapshots: SerializedFileHistorySnapshot[];
+}
+
+export interface UserTextElementsRecordPayload {
+  content: string;
+  textElements: unknown[];
 }
 
 export interface ChatRecordingFailureEvent {
@@ -510,6 +593,8 @@ export type ChatRecordingFailureListener = (
 export class ChatRecordingService {
   /** UUID of the active logical tail, including records queued for writing. */
   private lastRecordUuid: string | null = null;
+  /** UUID of the last active-tail record confirmed written to disk. */
+  private lastPersistedRecordUuid: string | null = null;
   private readonly config: Config;
   /**
    * Tracks the `lastRecordUuid` value just before each user turn was recorded.
@@ -523,22 +608,29 @@ export class ChatRecordingService {
    * record).
    */
   private turnParentUuids: Array<string | null> = [];
-  /**
-   * Cached chats-dir / conversation-file path so per-record appendRecord
-   * doesn't re-stat them on every write. The first call performs the
-   * mkdir / wx-create; subsequent calls short-circuit.
-   */
   private chatsDirEnsured = false;
   private cachedConversationFile: string | undefined;
-  /**
-   * Serialized async write queue for appendRecord. A rejected write leaves the
-   * canonical chain rejected so later queued records cannot be persisted with
-   * a parentUuid that never reached disk. Must be flushed before process exit
-   * (see {@link flush}).
-   */
-  private writeChain: Promise<void> = Promise.resolve();
+  private state:
+    | 'inactive'
+    | 'active'
+    | 'closing'
+    | 'closed'
+    | 'integrity_failed' = 'inactive';
+  private binding:
+    | {
+        readonly sessionId: string;
+        readonly lease: SessionWriterLease;
+      }
+    | undefined;
+  /** Serializes appends and authoritative read barriers. Always settles. */
+  private operationTail: Promise<void> = Promise.resolve();
+  private acceptingWrites = false;
+  private closePromise: Promise<void> | undefined;
+  private handoffRequested = false;
   /** First async JSONL write failure; permanently degrades this recorder. */
   private writeFailure: Error | undefined;
+  private integrityFailure: Error | undefined;
+  private readonly writerLeaseRequired: boolean;
   /** In-memory cache of the current session's custom title (for re-append on exit) */
   private currentCustomTitle: string | undefined;
   /**
@@ -551,6 +643,9 @@ export class ChatRecordingService {
    * idempotent — a bridge retry (after a failed response) must not append a
    * second `parent_session` record for the same immutable lineage. */
   private currentParentSessionId: string | undefined;
+  /** Immutable creator attribution once recorded. */
+  private currentSourceType: string | undefined;
+  private currentSourceId: string | undefined;
   /**
    * How many auto-title attempts have been made this process.
    *
@@ -609,34 +704,40 @@ export class ChatRecordingService {
   constructor(
     config: Config,
     private readonly onWriteFailure?: ChatRecordingFailureListener,
+    writerLeaseRequired = config.isSessionWriterLeaseEnabled?.() ??
+      config.getExperimentalZedIntegration?.() ??
+      true,
   ) {
     this.config = config;
-    this.lastRecordUuid =
-      config.getResumedSessionData()?.lastCompletedUuid ?? null;
+    this.writerLeaseRequired = writerLeaseRequired;
+    const resumed = config.getResumedSessionData();
+    if (writerLeaseRequired) {
+      this.lastRecordUuid = resumed?.lastCompletedUuid ?? null;
+      this.lastPersistedRecordUuid = this.lastRecordUuid;
+    } else {
+      this.state = 'active';
+      this.acceptingWrites = true;
+      this.restoreSessionState(
+        resumed
+          ? {
+              conversation: resumed.conversation ?? { messages: [] },
+              lastCompletedUuid: resumed.lastCompletedUuid,
+            }
+          : undefined,
+        resumed ? this.readPersistedTitleInfo() : undefined,
+      );
+    }
+  }
 
-    // On resume, load the cached custom title AND its source from the
-    // session file. Preserving the persisted source is load-bearing: the
-    // SessionPicker dim-styling depends on it, and hardcoding `'manual'`
-    // would silently downgrade auto-titled sessions every time they get
-    // resumed. Legacy records (no `titleSource` field) stay `undefined` —
-    // treated as manual for safety without rewriting the JSONL.
-    //
-    // Do not re-append during construction: loading/resuming a session is a
-    // read operation from the user's perspective, and touching the JSONL mtime
-    // would make session lists treat it as fresh activity.
-    if (config.getResumedSessionData()) {
-      try {
-        const sessionService = config.getSessionService();
-        const info = sessionService.getSessionTitleInfo(config.getSessionId());
-        this.currentCustomTitle = info.title;
-        this.currentTitleSource = info.source;
-        if (info.title) {
-          // Prime the threshold so the first real content write re-anchors.
-          this.bytesSinceTitleAnchor = TITLE_REANCHOR_BYTES;
-        }
-      } catch {
-        // Best-effort — don't block construction
-      }
+  private readPersistedTitleInfo():
+    | { title?: string; source?: TitleSource }
+    | undefined {
+    try {
+      return this.config
+        .getSessionService()
+        .getSessionTitleInfo(this.config.getSessionId());
+    } catch {
+      return undefined;
     }
   }
 
@@ -662,64 +763,105 @@ export class ChatRecordingService {
    * @returns The session ID.
    */
   private getSessionId(): string {
-    return this.config.getSessionId();
+    return this.binding?.sessionId ?? this.config.getSessionId();
   }
 
-  /**
-   * Ensures the chats directory exists, creating it if it doesn't exist.
-   * @returns The path to the chats directory.
-   * @throws Error if the directory cannot be created.
-   */
   private ensureChatsDir(): string {
-    const projectDir = this.config.storage.getProjectDir();
-    const chatsDir = path.join(projectDir, 'chats');
-
-    if (this.chatsDirEnsured) {
-      return chatsDir;
-    }
+    const chatsDir = path.join(this.config.storage.getProjectDir(), 'chats');
+    if (this.chatsDirEnsured) return chatsDir;
     try {
       fs.mkdirSync(chatsDir, { recursive: true });
-      // Only cache success — keep transient mkdir failures self-healing.
       this.chatsDirEnsured = true;
     } catch {
-      // ignored
+      // The file creation below reports the actionable error.
     }
     return chatsDir;
   }
 
-  /**
-   * Ensures the conversation file exists, creating it if it doesn't exist.
-   * Uses atomic file creation to avoid race conditions. Result is cached so
-   * subsequent appendRecord calls skip the wx-create entirely.
-   * @returns The path to the conversation file.
-   * @throws Error if the file cannot be created or accessed.
-   */
   private ensureConversationFile(): string {
-    if (this.cachedConversationFile) {
-      return this.cachedConversationFile;
-    }
-    const chatsDir = this.ensureChatsDir();
-    const sessionId = this.getSessionId();
-    const safeFilename = `${sessionId}.jsonl`;
-    const conversationFile = path.join(chatsDir, safeFilename);
-
+    if (this.cachedConversationFile) return this.cachedConversationFile;
+    const conversationFile = path.join(
+      this.ensureChatsDir(),
+      `${this.getSessionId()}.jsonl`,
+    );
     try {
-      // Use 'wx' flag for exclusive creation - atomic operation that fails if
-      // the file already exists. EEXIST is the expected steady-state path on
-      // resume; we treat it as success.
       fs.writeFileSync(conversationFile, '', { flag: 'wx', encoding: 'utf8' });
     } catch (error) {
-      const nodeError = error as NodeJS.ErrnoException;
-      if (nodeError.code !== 'EEXIST') {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(
           `Failed to create conversation file at ${conversationFile}: ${message}`,
         );
       }
     }
-
     this.cachedConversationFile = conversationFile;
     return conversationFile;
+  }
+
+  private restoreSessionState(
+    sessionData?: {
+      conversation: { messages: ChatRecord[] };
+      lastCompletedUuid: string | null;
+    },
+    persistedTitleInfo?: { title?: string; source?: TitleSource },
+  ): void {
+    this.lastRecordUuid = sessionData?.lastCompletedUuid ?? null;
+    this.lastPersistedRecordUuid = this.lastRecordUuid;
+    this.currentCustomTitle = undefined;
+    this.currentTitleSource = undefined;
+    this.currentParentSessionId = undefined;
+    this.currentSourceType = undefined;
+    this.currentSourceId = undefined;
+    if (!sessionData) return;
+    this.rebuildTurnBoundaries(sessionData.conversation.messages);
+    for (const record of sessionData.conversation.messages) {
+      if (record.type !== 'system') continue;
+      if (record.subtype === 'custom_title') {
+        const payload = record.systemPayload as
+          | CustomTitleRecordPayload
+          | undefined;
+        this.currentCustomTitle = payload?.customTitle;
+        this.currentTitleSource = payload?.titleSource;
+      } else if (record.subtype === 'parent_session') {
+        this.currentParentSessionId = (
+          record.systemPayload as ParentSessionRecordPayload | undefined
+        )?.parentSessionId;
+      } else if (record.subtype === 'session_source') {
+        const payload = record.systemPayload as
+          | SessionSourceRecordPayload
+          | undefined;
+        this.currentSourceType = payload?.sourceType;
+        this.currentSourceId = payload?.sourceId;
+      }
+    }
+    if (persistedTitleInfo !== undefined) {
+      this.currentCustomTitle = persistedTitleInfo.title;
+      this.currentTitleSource = persistedTitleInfo.source;
+    }
+    if (this.currentCustomTitle) {
+      this.bytesSinceTitleAnchor = TITLE_REANCHOR_BYTES;
+    }
+  }
+
+  activate(
+    lease: SessionWriterLease,
+    sessionData?: {
+      conversation: { messages: ChatRecord[] };
+      lastCompletedUuid: string | null;
+    },
+    persistedTitleInfo?: { title?: string; source?: TitleSource },
+  ): void {
+    if (
+      !this.writerLeaseRequired ||
+      this.state !== 'inactive' ||
+      lease.sessionId !== this.config.getSessionId()
+    ) {
+      throw new SessionWriterUnavailableError();
+    }
+    this.binding = { sessionId: lease.sessionId, lease };
+    this.restoreSessionState(sessionData, persistedTitleInfo);
+    this.state = 'active';
+    this.acceptingWrites = true;
   }
 
   /**
@@ -735,6 +877,14 @@ export class ChatRecordingService {
       sessionId: this.getSessionId(),
       timestamp: new Date().toISOString(),
       type,
+      provenance:
+        type === 'user'
+          ? 'real_user'
+          : type === 'assistant'
+            ? 'assistant_output'
+            : type === 'tool_result'
+              ? 'tool_result'
+              : 'system',
       cwd,
       version: this.config.getCliVersion() || 'unknown',
       gitBranch: this.getCachedGitBranch(cwd),
@@ -748,11 +898,29 @@ export class ChatRecordingService {
     return this.cachedGitBranch.branch;
   }
 
-  private enterWriteFailure(cause: unknown, sessionId: string): Error {
+  private enterWriteFailure(
+    cause: unknown,
+    sessionId: string,
+    operation = 'append',
+  ): Error {
+    const failure = cause instanceof Error ? cause : new Error(String(cause));
+    this.acceptingWrites = false;
+    if (
+      !this.integrityFailure &&
+      (failure instanceof SessionWriterLostError ||
+        failure instanceof SessionTranscriptChangedError ||
+        failure instanceof SessionWriterUnavailableError)
+    ) {
+      this.integrityFailure = failure;
+      this.state = 'integrity_failed';
+      debugLogger.error(
+        `Session writer failure sessionId=${sessionId} operation=${operation} errorKind=${failure.errorKind}`,
+      );
+    }
     if (!this.writeFailure) {
-      this.writeFailure =
-        cause instanceof Error ? cause : new Error(String(cause));
-      debugLogger.error('Error appending record (async):', this.writeFailure);
+      this.writeFailure = failure;
+      this.lastRecordUuid = this.lastPersistedRecordUuid;
+      debugLogger.error('Chat recording failure:', this.writeFailure);
       try {
         const notification = this.onWriteFailure?.({
           sessionId,
@@ -770,29 +938,41 @@ export class ChatRecordingService {
         debugLogger.debug('Chat recording failure listener threw:', error);
       }
     }
-    return this.writeFailure;
+    return this.integrityFailure ?? this.writeFailure;
   }
 
   private enqueueRecordWrite(
-    conversationFile: string,
     record: ChatRecord,
+    legacyConversationFile?: string,
+    updateActiveTail = true,
   ): Promise<void> {
-    const pendingWrite = this.writeChain.then(async () => {
+    const pendingWrite = this.operationTail.then(async () => {
+      if (this.writeFailure) throw this.writeFailure;
       try {
-        await jsonl.writeLine(conversationFile, record);
+        const lease = this.binding?.lease;
+        if (lease) {
+          await lease.appendJsonLine(record);
+        } else if (!this.writerLeaseRequired && legacyConversationFile) {
+          await jsonl.writeLine(legacyConversationFile, record);
+        } else {
+          throw new SessionWriterUnavailableError();
+        }
+        if (updateActiveTail) {
+          this.lastPersistedRecordUuid = record.uuid;
+        }
       } catch (error) {
         throw this.enterWriteFailure(error, record.sessionId);
       }
     });
-    this.writeChain = pendingWrite;
-    // Mark fire-and-forget writes as handled without replacing the canonical
-    // rejected chain that flush() and strict callers must continue to observe.
-    void pendingWrite.catch(() => {});
+    this.operationTail = pendingWrite.then(
+      () => undefined,
+      () => undefined,
+    );
     return pendingWrite;
   }
 
   /**
-   * Fire-and-forget: queues a JSONL write on the internal writeChain.
+   * Fire-and-forget: queues a JSONL write on the internal operation tail.
    * A failed write permanently degrades this recorder; already-queued
    * descendants are skipped and later fire-and-forget calls become no-ops.
    */
@@ -800,19 +980,17 @@ export class ChatRecordingService {
     record: ChatRecord,
     options?: { updateActiveTail?: boolean },
   ): void {
-    if (this.writeFailure) return;
-
-    let conversationFile: string;
-    try {
-      conversationFile = this.ensureConversationFile();
-    } catch (error) {
-      debugLogger.error('Error appending record:', error);
-      throw error;
+    if (this.writeFailure || !this.acceptingWrites || this.state !== 'active') {
+      return;
     }
-    if (options?.updateActiveTail !== false) {
+    const legacyConversationFile = this.writerLeaseRequired
+      ? undefined
+      : this.ensureConversationFile();
+    const updateActiveTail = options?.updateActiveTail !== false;
+    if (updateActiveTail) {
       this.lastRecordUuid = record.uuid;
     }
-    this.enqueueRecordWrite(conversationFile, record);
+    this.enqueueRecordWrite(record, legacyConversationFile, updateActiveTail);
     this.updateTitleAnchorTracking(record);
   }
 
@@ -821,34 +999,28 @@ export class ChatRecordingService {
     options?: { updateActiveTail?: boolean },
   ): Promise<void> {
     if (this.writeFailure) throw this.writeFailure;
-
-    const previousLastRecordUuid = this.lastRecordUuid;
-    const updateActiveTail = options?.updateActiveTail !== false;
-    let conversationFile: string;
-    try {
-      conversationFile = this.ensureConversationFile();
-    } catch (error) {
-      debugLogger.error('Error appending record:', error);
-      throw error;
+    if (!this.acceptingWrites || this.state !== 'active') {
+      throw new SessionWriterUnavailableError();
     }
 
+    const updateActiveTail = options?.updateActiveTail !== false;
+    const legacyConversationFile = this.writerLeaseRequired
+      ? undefined
+      : this.ensureConversationFile();
     if (updateActiveTail) {
       this.lastRecordUuid = record.uuid;
     }
-    const pendingWrite = this.enqueueRecordWrite(conversationFile, record);
+    const pendingWrite = this.enqueueRecordWrite(
+      record,
+      legacyConversationFile,
+      updateActiveTail,
+    );
     // Keep anchor accounting in logical queue order, matching appendRecord.
     // Once accepted, a failed write permanently stops this recorder, so no
     // rollback of this bookkeeping is needed on rejection.
     this.updateTitleAnchorTracking(record);
 
-    try {
-      await pendingWrite;
-    } catch (error) {
-      if (updateActiveTail && this.lastRecordUuid === record.uuid) {
-        this.lastRecordUuid = previousLastRecordUuid;
-      }
-      throw error;
-    }
+    await pendingWrite;
   }
 
   /**
@@ -941,7 +1113,160 @@ export class ChatRecordingService {
    * teardown to ensure no records are dropped.
    */
   async flush(): Promise<void> {
-    await this.writeChain;
+    await this.operationTail;
+    if (this.writeFailure) throw this.writeFailure;
+  }
+
+  async runWithWriteBarrier<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.writeFailure) throw this.writeFailure;
+    if (!this.acceptingWrites || this.state !== 'active') {
+      throw new SessionWriterUnavailableError();
+    }
+    const pending = this.operationTail.then(async () => {
+      if (this.writeFailure) throw this.writeFailure;
+      const lease = this.binding?.lease;
+      try {
+        if (lease) {
+          await lease.assertOwnedAndUnchanged();
+        } else if (this.writerLeaseRequired) {
+          throw new SessionWriterUnavailableError();
+        }
+        const result = await operation();
+        await lease?.assertOwnedAndUnchanged();
+        return result;
+      } catch (error) {
+        if (
+          error instanceof SessionWriterLostError ||
+          error instanceof SessionTranscriptChangedError ||
+          error instanceof SessionWriterUnavailableError
+        ) {
+          throw this.enterWriteFailure(
+            error,
+            this.getSessionId(),
+            'read_barrier',
+          );
+        }
+        throw error;
+      }
+    });
+    this.operationTail = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return pending;
+  }
+
+  async assertCanStartTurn(): Promise<void> {
+    try {
+      await this.runWithWriteBarrier(async () => undefined);
+    } catch (error) {
+      if (this.integrityFailure) throw this.integrityFailure;
+      if (this.writeFailure) {
+        throw new SessionWriterUnavailableError({ cause: this.writeFailure });
+      }
+      throw error;
+    }
+  }
+
+  close(options?: { handoff?: boolean }): Promise<void> {
+    if (options?.handoff) {
+      this.handoffRequested = true;
+    }
+    if (this.closePromise) return this.closePromise;
+    if (this.state === 'closed') return Promise.resolve();
+    this.beginClose(options);
+    this.closePromise = this.closeOnce();
+    return this.closePromise;
+  }
+
+  beginClose(options?: { handoff?: boolean }): void {
+    if (options?.handoff) {
+      this.handoffRequested = true;
+    }
+    this.autoTitleController?.abort();
+    this.acceptingWrites = false;
+    if (this.state === 'active') {
+      this.state = 'closing';
+    }
+  }
+
+  private async closeOnce(): Promise<void> {
+    let flushFailure: unknown;
+    try {
+      await this.flush();
+    } catch (error) {
+      flushFailure = error;
+    }
+    if (this.handoffRequested && flushFailure !== undefined) {
+      // Fail closed: a handoff whose final flush did not durably land must
+      // neither seal (the proof would be incomplete) nor release (a successor
+      // could take over records that were never persisted). Unlike the
+      // release-then-throw normal-close path below, it retains the active lock
+      // so write ownership stays unambiguous until an external writer fence
+      // recovers it.
+      this.state = 'integrity_failed';
+      throw flushFailure;
+    }
+    const lease = this.binding?.lease;
+    try {
+      if (this.handoffRequested) {
+        await lease?.sealForHandoff();
+      } else {
+        await lease?.release();
+      }
+      this.binding = undefined;
+      this.state = 'closed';
+    } catch (error) {
+      if (lease?.isReleased || error instanceof SessionWriterLostError) {
+        this.binding = undefined;
+        this.state = 'closed';
+      } else {
+        this.state = 'integrity_failed';
+      }
+      throw error;
+    }
+    if (flushFailure !== undefined) throw flushFailure;
+  }
+
+  hasWriteOwnership(): boolean {
+    return this.binding !== undefined;
+  }
+
+  async readActiveTranscriptChain(): Promise<readonly ChatRecord[]> {
+    await this.flush();
+    const sessionId = this.getSessionId();
+    const session = await this.config
+      .getSessionService()
+      .loadSession(sessionId);
+    if (!session) {
+      throw new Error(
+        `Unable to load active transcript for session ${sessionId}`,
+      );
+    }
+    return session.conversation.messages;
+  }
+
+  getTranscriptCursor(): TranscriptCursor {
+    return { recordId: this.lastRecordUuid };
+  }
+
+  async recordGoalState(
+    recordUuid: string,
+    payload: GoalStateRecordPayloadV2,
+  ): Promise<ChatRecord> {
+    const record: ChatRecord = {
+      ...this.createBaseRecord('system'),
+      uuid: recordUuid,
+      type: 'system',
+      subtype: 'goal_state',
+      provenance: 'goal_control',
+      systemPayload: {
+        ...payload,
+        snapshot: { ...payload.snapshot, activity: 'idle' },
+      },
+    };
+    await this.appendRecordStrict(record);
+    return record;
   }
 
   /**
@@ -950,6 +1275,9 @@ export class ChatRecordingService {
    * resolve the JSONL path through the updated Config.storage.
    */
   resetStoragePaths(): void {
+    if (this.writerLeaseRequired && this.state === 'active') {
+      throw new SessionWriterUnavailableError();
+    }
     this.chatsDirEnsured = false;
     this.cachedConversationFile = undefined;
   }
@@ -960,16 +1288,40 @@ export class ChatRecordingService {
    *
    * @param message The raw PartListUnion object as used with the API
    */
-  recordUserMessage(message: PartListUnion): void {
+  recordUserMessage(
+    message: PartListUnion,
+    goalContext?: GoalTurnPermit,
+    payload?: UserPromptRecordPayload,
+  ): void {
     try {
       this.turnParentUuids.push(this.lastRecordUuid);
       const record: ChatRecord = {
         ...this.createBaseRecord('user'),
+        ...(goalContext ? { goalContext: copyGoalContext(goalContext) } : {}),
         message: createUserContent(message),
+        ...(payload ? { systemPayload: payload } : {}),
       };
       this.appendRecord(record);
     } catch (error) {
       debugLogger.error('Error saving user message:', error);
+    }
+  }
+
+  recordGoalRuntimeMessage(
+    message: PartListUnion,
+    goalContext: GoalTurnPermit,
+  ): void {
+    try {
+      const record: ChatRecord = {
+        ...this.createBaseRecord('user'),
+        subtype: 'goal_runtime',
+        provenance: 'goal_runtime',
+        goalContext: copyGoalContext(goalContext),
+        message: createUserContent(message),
+      };
+      this.appendRecord(record);
+    } catch (error) {
+      debugLogger.error('Error saving Goal runtime message:', error);
     }
   }
 
@@ -980,11 +1332,16 @@ export class ChatRecordingService {
    * tool results. Keeping a distinct subtype lets resume reconstruct that shape
    * instead of replaying consecutive user-role entries.
    */
-  recordMidTurnUserMessage(message: PartListUnion, displayText?: string): void {
+  recordMidTurnUserMessage(
+    message: PartListUnion,
+    displayText?: string,
+    goalContext?: GoalTurnPermit,
+  ): void {
     try {
       const record: ChatRecord = {
         ...this.createBaseRecord('user'),
         subtype: 'mid_turn_user_message',
+        ...(goalContext ? { goalContext: copyGoalContext(goalContext) } : {}),
         message: createUserContent(message),
         systemPayload: displayText
           ? ({ displayText } as NotificationRecordPayload)
@@ -1001,8 +1358,18 @@ export class ChatRecordingService {
    * Stored as a user-role message with subtype 'cron' so the UI
    * restores it as a notification item instead of a user turn.
    */
-  recordCronPrompt(message: PartListUnion, displayText?: string): void {
-    this.recordNotificationLike(message, 'cron', displayText);
+  recordCronPrompt(
+    message: PartListUnion,
+    displayText?: string,
+    goalContext?: GoalTurnPermit,
+  ): void {
+    this.recordNotificationLike(
+      message,
+      'cron',
+      displayText,
+      undefined,
+      goalContext,
+    );
   }
 
   /**
@@ -1010,28 +1377,79 @@ export class ChatRecordingService {
    * Stored as a user-role message with subtype 'notification' so the
    * UI restores it as an info item, not a user turn.
    */
-  recordNotification(message: PartListUnion, displayText?: string): void {
-    this.recordNotificationLike(message, 'notification', displayText);
+  recordNotification(
+    message: PartListUnion,
+    displayText?: string,
+    backgroundTask?: NotificationRecordPayload['backgroundTask'],
+    goalContext?: GoalTurnPermit,
+  ): void {
+    this.recordNotificationLike(
+      message,
+      'notification',
+      displayText,
+      backgroundTask,
+      goalContext,
+    );
+  }
+
+  /**
+   * Durably records a daemon-delivered notification before its sender is
+   * acknowledged. Unlike the ordinary in-process notification path, this
+   * rejects when the writer is unavailable or the append fails.
+   */
+  async recordNotificationStrict(
+    message: PartListUnion,
+    displayText?: string,
+    backgroundTask?: NotificationRecordPayload['backgroundTask'],
+  ): Promise<void> {
+    await this.appendRecordStrict(
+      this.createNotificationRecord(
+        message,
+        'notification',
+        displayText,
+        backgroundTask,
+      ),
+    );
   }
 
   private recordNotificationLike(
     message: PartListUnion,
     subtype: 'notification' | 'cron',
     displayText?: string,
+    backgroundTask?: NotificationRecordPayload['backgroundTask'],
+    goalContext?: GoalTurnPermit,
   ): void {
     try {
-      const record: ChatRecord = {
-        ...this.createBaseRecord('user'),
+      const record = this.createNotificationRecord(
+        message,
         subtype,
-        message: createUserContent(message),
-        systemPayload: displayText
-          ? ({ displayText } as NotificationRecordPayload)
-          : undefined,
-      };
+        displayText,
+        backgroundTask,
+        goalContext,
+      );
       this.appendRecord(record);
     } catch (error) {
       debugLogger.error(`Error saving ${subtype} record:`, error);
     }
+  }
+
+  private createNotificationRecord(
+    message: PartListUnion,
+    subtype: 'notification' | 'cron',
+    displayText?: string,
+    backgroundTask?: NotificationRecordPayload['backgroundTask'],
+    goalContext?: GoalTurnPermit,
+  ): ChatRecord {
+    return {
+      ...this.createBaseRecord('user'),
+      subtype,
+      provenance: 'system',
+      ...(goalContext ? { goalContext: copyGoalContext(goalContext) } : {}),
+      message: createUserContent(message),
+      systemPayload: displayText
+        ? ({ displayText, backgroundTask } as NotificationRecordPayload)
+        : undefined,
+    };
   }
 
   /**
@@ -1049,11 +1467,15 @@ export class ChatRecordingService {
     message?: PartListUnion;
     tokens?: GenerateContentResponseUsageMetadata;
     contextWindowSize?: number;
+    goalContext?: GoalTurnPermit;
   }): void {
     try {
       const record: ChatRecord = {
         ...this.createBaseRecord('assistant'),
         model: data.model,
+        ...(data.goalContext
+          ? { goalContext: copyGoalContext(data.goalContext) }
+          : {}),
       };
 
       if (data.message !== undefined) {
@@ -1072,6 +1494,27 @@ export class ChatRecordingService {
       this.maybeTriggerAutoTitle();
     } catch (error) {
       debugLogger.error('Error saving assistant turn:', error);
+    }
+  }
+
+  async recordRealtimeConversation(
+    entries: ReadonlyArray<{
+      role: 'user' | 'assistant';
+      text: string;
+    }>,
+    model: string,
+  ): Promise<void> {
+    for (const entry of entries) {
+      const record: ChatRecord = {
+        ...this.createBaseRecord(entry.role),
+        subtype: 'realtime_message',
+        message:
+          entry.role === 'user'
+            ? createUserContent([{ text: entry.text }])
+            : createModelContent([{ text: entry.text }]),
+        ...(entry.role === 'assistant' ? { model } : {}),
+      };
+      await this.appendRecordStrict(record);
     }
   }
 
@@ -1184,10 +1627,15 @@ export class ChatRecordingService {
   recordToolResult(
     message: PartListUnion,
     toolCallResult?: Partial<ToolCallResponseInfo> & { status: Status },
+    options?: RecordToolResultOptions,
   ): void {
     try {
       const record: ChatRecord = {
         ...this.createBaseRecord('tool_result'),
+        ...(options?.goalContext
+          ? { goalContext: copyGoalContext(options.goalContext) }
+          : {}),
+        ...(options?.provenance ? { provenance: options.provenance } : {}),
         message: createUserContent(message),
       };
 
@@ -1342,9 +1790,11 @@ export class ChatRecordingService {
       const record = messages[i];
       if (
         record.type === 'user' &&
+        record.subtype !== 'goal_runtime' &&
         record.subtype !== 'notification' &&
         record.subtype !== 'cron' &&
-        record.subtype !== 'mid_turn_user_message'
+        record.subtype !== 'mid_turn_user_message' &&
+        record.subtype !== 'realtime_message'
       ) {
         // Reconstructed histories can start mid-chain; the persisted edge is
         // the source of truth, not the previous item in this sliced list.
@@ -1354,6 +1804,7 @@ export class ChatRecordingService {
     // Ensure lastRecordUuid points to the end of the reconstructed chain.
     if (messages.length > 0) {
       this.lastRecordUuid = messages[messages.length - 1].uuid;
+      this.lastPersistedRecordUuid = this.lastRecordUuid;
     }
   }
 
@@ -1501,6 +1952,39 @@ export class ChatRecordingService {
     }
   }
 
+  /** Persist immutable creator attribution near the start of the transcript. */
+  async recordSessionSource(
+    sourceType: string,
+    sourceId?: string,
+  ): Promise<boolean> {
+    if (this.currentSourceType !== undefined) {
+      return (
+        this.currentSourceType === sourceType &&
+        this.currentSourceId === sourceId
+      );
+    }
+    try {
+      const record: ChatRecord = {
+        ...this.createBaseRecord('system'),
+        type: 'system',
+        subtype: 'session_source',
+        systemPayload: {
+          sourceType,
+          ...(sourceId !== undefined ? { sourceId } : {}),
+        },
+      };
+      await this.appendRecordStrict(record);
+      this.currentSourceType = sourceType;
+      this.currentSourceId = sourceId;
+      return true;
+    } catch (error) {
+      if (error !== this.writeFailure) {
+        debugLogger.error('Error saving session source:', error);
+      }
+      return false;
+    }
+  }
+
   /**
    * Finalizes the current session by re-appending cached metadata to EOF, but
    * only after this recorder has appended non-title content since the last
@@ -1631,6 +2115,18 @@ export class ChatRecordingService {
     } catch (error) {
       debugLogger.error('Error saving file history snapshot batch:', error);
     }
+  }
+
+  async recordUserTextElements(
+    payload: UserTextElementsRecordPayload,
+  ): Promise<void> {
+    const record: ChatRecord = {
+      ...this.createBaseRecord('system'),
+      type: 'system',
+      subtype: 'user_text_elements',
+      systemPayload: payload,
+    };
+    await this.appendRecordStrict(record);
   }
 
   private appendSerializedFileHistorySnapshotBatch(

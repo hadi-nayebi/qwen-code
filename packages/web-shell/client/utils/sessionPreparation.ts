@@ -2,6 +2,7 @@ import {
   DAEMON_APPROVAL_MODES,
   type DaemonApprovalMode,
 } from '@qwen-code/webui/daemon-react-sdk';
+import { WEB_SHELL_SESSION_SOURCE_TYPE } from '../constants/sessions';
 
 const SESSION_CREATED_CALLBACK_TIMEOUT_MS = 30_000;
 
@@ -9,7 +10,14 @@ type PromptSessionActions = {
   createSession: (options?: {
     workspaceCwd?: string;
     approvalMode?: DaemonApprovalMode;
-  }) => Promise<{ sessionId: string }>;
+    sourceType?: string;
+    worktree?: { slug?: string };
+    branch?: { name: string };
+  }) => Promise<{
+    sessionId: string;
+    worktree?: { slug: string; path: string; branch: string };
+    branch?: { name: string; baseBranch: string };
+  }>;
   attachSession: () => Promise<void>;
   clearSession: () => Promise<void>;
   releaseSession: (sessionId: string) => Promise<void>;
@@ -25,6 +33,8 @@ export async function createAndAttachSessionForPrompt({
   modelId,
   modeId,
   workspaceCwd,
+  worktree,
+  branch,
   onSessionCreated,
   onSessionAllocated,
   getCurrentSessionId,
@@ -34,11 +44,16 @@ export async function createAndAttachSessionForPrompt({
   modelId?: string;
   modeId?: string;
   workspaceCwd?: string;
+  worktree?: { slug?: string };
+  branch?: { name: string };
   onSessionCreated?: (sessionId: string) => Promise<void> | void;
   onSessionAllocated?: (sessionId: string) => void;
   getCurrentSessionId: () => string | undefined;
   warn?: (message?: unknown, ...optionalParams: unknown[]) => void;
-}): Promise<void> {
+}): Promise<{
+  worktree?: { slug: string; path: string; branch: string };
+  branch?: { name: string; baseBranch: string };
+}> {
   // Seed the approval mode in the create request itself so the daemon applies
   // it atomically at spawn (`POST /session` → `spawnOrAttach({ approvalMode })`),
   // saving a follow-up round-trip. Approval mode is fail-closed at spawn: if the
@@ -47,9 +62,16 @@ export async function createAndAttachSessionForPrompt({
   // The model, by contrast, stays a best-effort follow-up below.
   const approvalMode =
     modeId && isDaemonApprovalMode(modeId) ? modeId : undefined;
-  const { sessionId } = await sessionActions.createSession({
+  const {
+    sessionId,
+    worktree: worktreeInfo,
+    branch: branchInfo,
+  } = await sessionActions.createSession({
     workspaceCwd,
+    sourceType: WEB_SHELL_SESSION_SOURCE_TYPE,
     ...(approvalMode ? { approvalMode } : {}),
+    ...(worktree ? { worktree } : {}),
+    ...(branch ? { branch } : {}),
   });
   onSessionAllocated?.(sessionId);
   let preparationStep = 'prepare new session';
@@ -121,4 +143,8 @@ export async function createAndAttachSessionForPrompt({
       warn('[WebShell] failed to set model for new session:', error);
     });
   }
+  return {
+    ...(worktreeInfo ? { worktree: worktreeInfo } : {}),
+    ...(branchInfo ? { branch: branchInfo } : {}),
+  };
 }

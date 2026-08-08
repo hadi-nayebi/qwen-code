@@ -49,6 +49,8 @@ import { useShellFocusState } from '../contexts/ShellFocusContext.js';
 import { useUIState } from '../contexts/UIStateContext.js';
 import { useUIActions } from '../contexts/UIActionsContext.js';
 import { useSettings } from '../contexts/SettingsContext.js';
+import { useVirtualViewport } from '../contexts/VirtualViewportContext.js';
+import { useMouseTrackingEnabled } from '../hooks/use-mouse-tracking-enabled.js';
 import { useKeypressContext } from '../contexts/KeypressContext.js';
 import {
   useAgentViewState,
@@ -61,6 +63,7 @@ import {
 import {
   isLiveAgentPanelVisibleEntry,
   LIVE_AGENT_PANEL_MAX_ROWS,
+  getLiveAgentPanelVpMaxRows,
 } from './background-view/liveAgentPanelVisibility.js';
 import { panelDisplayOrder } from './background-view/agent-forest.js';
 import { FEEDBACK_DIALOG_KEYS } from '../FeedbackDialog.js';
@@ -165,7 +168,13 @@ export function expandPendingPastePlaceholders(
 
 export interface InputPromptProps {
   buffer: TextBuffer;
-  onSubmit: (value: string) => void;
+  onSubmit: (
+    value: string,
+    options?: {
+      deferUntilIdle?: boolean;
+      submittedPrompt?: string;
+    },
+  ) => void;
   userMessages: readonly string[];
   onClearScreen: () => void;
   config: Config;
@@ -246,7 +255,10 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   const settings = useSettings();
   // Mouse interactions (suggestion list + click-to-position cursor) are enabled
   // in alternate-screen mode (see RowMouseController's coordinate assumptions).
-  const mouseInteractionsEnabled = !!settings.merged.ui?.useTerminalBuffer;
+  const mouseTrackingEnabled = useMouseTrackingEnabled();
+  const mouseInteractionsEnabled =
+    useVirtualViewport(settings.merged.ui?.useTerminalBuffer) &&
+    mouseTrackingEnabled;
   const { pasteWorkaround } = useKeypressContext();
   const { agents, agentTabBarFocused } = useAgentViewState();
   const { setAgentTabBarFocused } = useAgentViewActions();
@@ -271,12 +283,18 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   // `livePanelSelectedIndex - 1` indexes the same agent the user sees
   // highlighted. Filtering alone (snapshot order, newest-first, unsliced)
   // opened the wrong agent's detail on Enter.
+  // Window by the same cap the panel actually renders (VP mode uses a
+  // height-aware cap via getLiveAgentPanelVpMaxRows in DefaultAppLayout)
+  // so the keyboard selection can't address a row that is scrolled off.
+  const liveAgentPanelMaxRows = uiState.useTerminalBuffer
+    ? getLiveAgentPanelVpMaxRows(uiState.terminalHeight)
+    : LIVE_AGENT_PANEL_MAX_ROWS;
   const getVisibleBgAgents = useCallback(
     () =>
       panelDisplayOrder(
         bgEntries.filter((e) => isLiveAgentPanelVisibleEntry(e, Date.now())),
-      ).slice(-LIVE_AGENT_PANEL_MAX_ROWS),
-    [bgEntries],
+      ).slice(-liveAgentPanelMaxRows),
+    [bgEntries, liveAgentPanelMaxRows],
   );
   const hasActiveToolConfirmation = useMemo(
     () =>
@@ -585,9 +603,10 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   const resetHistoryNavRef = useRef<() => void>(() => {});
 
   const handleSubmitAndClear = useCallback(
-    (submittedValue: string) => {
+    (submittedValue: string, deferUntilIdle = false) => {
       exportCompletion.reset();
       // Expand any large paste placeholders to their full content before submitting
+      const submittedPrompt = submittedValue;
       let finalValue = submittedValue;
       if (pendingPastes.size > 0) {
         finalValue = expandPendingPastePlaceholders(finalValue, pendingPastes);
@@ -610,7 +629,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       // if onSubmit triggers a re-render while the buffer still holds the old value.
       buffer.setText('');
       clearPromptStash(targetDir);
-      onSubmit(finalValue);
+      onSubmit(finalValue, { deferUntilIdle, submittedPrompt });
 
       // Reset history navigation so the next Up-arrow starts from the newest
       // entry rather than advancing from whatever index the user picked.
@@ -654,10 +673,11 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
 
   const customSetTextAndResetCompletionSignal = useCallback(
     (newText: string) => {
+      uiActions.invalidateSubmittedPromptProvenance();
       buffer.setText(newText);
       setHistoryRestoredText(newText);
     },
-    [buffer],
+    [buffer, uiActions],
   );
 
   const inputHistory = useInputHistory({
@@ -1273,6 +1293,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             }
           }
           if (keyMatchers[Command.ACCEPT_SUGGESTION_REVERSE_SEARCH](key)) {
+            uiActions.invalidateSubmittedPromptProvenance();
             sc.handleAutocomplete(activeSuggestionIndex);
             resetState();
             setActive(false);
@@ -1285,6 +1306,9 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             showSuggestions && activeSuggestionIndex > -1
               ? suggestions[activeSuggestionIndex].value
               : buffer.text;
+          if (showSuggestions && activeSuggestionIndex > -1) {
+            uiActions.invalidateSubmittedPromptProvenance();
+          }
           handleSubmitAndClear(textToSubmit);
           resetState();
           setActive(false);
@@ -1330,7 +1354,9 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       };
 
       // If the command is a perfect match, pressing enter should execute it.
-      if (completion.isPerfectMatch && keyMatchers[Command.RETURN](key)) {
+      // Use SUBMIT (which requires shift: false) instead of RETURN to avoid
+      // intercepting Shift+Enter as submit when the user wants a newline.
+      if (completion.isPerfectMatch && keyMatchers[Command.SUBMIT](key)) {
         if (
           showCompletionSuggestions &&
           exportCompletion.navigatedRef.current &&
@@ -1384,6 +1410,23 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       }
 
       if (showCompletionSuggestions) {
+        // Category tab switching for the tabbed `@` completion UI. Only consume
+        // Ctrl+←/→ (per the COMPLETION_TAB_* bindings) and only when there are
+        // more than two tabs (at least 3 entries including 'all'). Plain ←/→ are
+        // never consumed here, so they always move the caret in the editable buffer.
+        if ((completion.availableCategories?.length ?? 0) > 2) {
+          if (keyMatchers[Command.COMPLETION_TAB_RIGHT](key)) {
+            completion.switchCategory(1);
+            setExpandedSuggestionIndex(-1);
+            return true;
+          }
+          if (keyMatchers[Command.COMPLETION_TAB_LEFT](key)) {
+            completion.switchCategory(-1);
+            setExpandedSuggestionIndex(-1);
+            return true;
+          }
+        }
+
         if (completion.suggestions.length > 1) {
           const isCompletionUpKey = keyMatchers[Command.COMPLETION_UP](key);
           const isCompletionDownKey = keyMatchers[Command.COMPLETION_DOWN](key);
@@ -1616,14 +1659,27 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         // Shell History Navigation
         if (keyMatchers[Command.NAVIGATION_UP](key)) {
           const prevCommand = shellHistory.getPreviousCommand();
-          if (prevCommand !== null) buffer.setText(prevCommand);
+          if (prevCommand !== null) {
+            uiActions.invalidateSubmittedPromptProvenance();
+            buffer.setText(prevCommand);
+          }
           return true;
         }
         if (keyMatchers[Command.NAVIGATION_DOWN](key)) {
           const nextCommand = shellHistory.getNextCommand();
-          if (nextCommand !== null) buffer.setText(nextCommand);
+          if (nextCommand !== null) {
+            uiActions.invalidateSubmittedPromptProvenance();
+            buffer.setText(nextCommand);
+          }
           return true;
         }
+      }
+
+      if (keyMatchers[Command.QUEUE_MESSAGE](key)) {
+        if (buffer.text.trim()) {
+          handleSubmitAndClear(buffer.text, true);
+        }
+        return true;
       }
 
       if (keyMatchers[Command.SUBMIT](key)) {
@@ -1992,6 +2048,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         const sc = isCommandSearch
           ? commandSearchCompletion
           : reverseSearchCompletion;
+        uiActions.invalidateSubmittedPromptProvenance();
         sc.handleAutocomplete(index);
         sc.resetCompletionState();
         (isCommandSearch ? setCommandSearchActive : setReverseSearchActive)(
@@ -2039,6 +2096,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       setExpandedSuggestionIndex,
       setCommandSearchActive,
       setReverseSearchActive,
+      uiActions,
     ],
   );
 
@@ -2210,6 +2268,20 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             }
             expandedIndex={expandedSuggestionIndex}
             mouseEnabled={mouseInteractionsEnabled}
+            activeCategory={
+              suggestionsFromExport ||
+              commandSearchActive ||
+              reverseSearchActive
+                ? undefined
+                : completion.activeCategory
+            }
+            availableCategories={
+              suggestionsFromExport ||
+              commandSearchActive ||
+              reverseSearchActive
+                ? undefined
+                : completion.availableCategories
+            }
             onHoverIndex={
               suggestionsFromExport ? undefined : handleSuggestionHover
             }

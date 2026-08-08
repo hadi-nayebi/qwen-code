@@ -17,10 +17,17 @@ import {
   buildResumedHistoryItems,
   applyCollapsePolicyAndSummary,
 } from '../utils/resumeHistoryUtils.js';
-import { restoreGoalFromHistory } from '../utils/restoreGoal.js';
 import type { UseHistoryManagerReturn } from './useHistoryManager.js';
 import type { LoadedSettings } from '../../config/settings.js';
 import { t } from '../../i18n/index.js';
+import {
+  hasBlockingBackgroundWork,
+  resetBackgroundStateForSessionSwitch,
+} from '../utils/backgroundWorkUtils.js';
+import { waitForGoalRuntime } from '../utils/goal-runtime.js';
+
+const BACKGROUND_WORK_BRANCH_BLOCKED_MESSAGE =
+  "Stop the current session's running background tasks before branching the conversation.";
 
 /**
  * Derives a short one-line title from the first *real* user message in the
@@ -61,6 +68,7 @@ export interface UseBranchCommandOptions {
     'clearItems' | 'loadHistory' | 'addItem'
   >;
   startNewSession: (sessionId: string) => void;
+  clearPendingState?: () => void;
   setSessionName?: (name: string | null) => void;
   remount?: () => void;
 }
@@ -86,12 +94,29 @@ export interface UseBranchCommandResult {
 export function useBranchCommand(
   options: UseBranchCommandOptions,
 ): UseBranchCommandResult {
-  const { config, historyManager, startNewSession, setSessionName, remount } =
-    options;
+  const {
+    config,
+    historyManager,
+    startNewSession,
+    clearPendingState,
+    setSessionName,
+    remount,
+  } = options;
 
   const handleBranch = useCallback(
     async (name?: string) => {
       if (!config) return;
+
+      if (hasBlockingBackgroundWork(config)) {
+        historyManager.addItem(
+          {
+            type: 'error',
+            text: t(BACKGROUND_WORK_BRANCH_BLOCKED_MESSAGE),
+          },
+          Date.now(),
+        );
+        return;
+      }
 
       const oldSessionId = config.getSessionId();
       const newSessionId = randomUUID();
@@ -170,6 +195,7 @@ export function useBranchCommand(
         //    the parent, silently recording user input into an orphan.
         config.startNewSession(newSessionId, resumed);
         coreSwapped = true;
+        await waitForGoalRuntime(config);
         await config.getGeminiClient()?.initialize?.(SessionStartSource.Branch);
 
         // 8. Swap UI. Once this commits, rolling core back is unsafe —
@@ -189,27 +215,13 @@ export function useBranchCommand(
           collapsePreviewCount,
         );
         startNewSession(newSessionId);
+        clearPendingState?.();
         historyManager.clearItems();
         historyManager.loadHistory(uiHistoryItems);
         uiSwapped = true;
+        resetBackgroundStateForSessionSwitch(config);
 
-        // 9. Re-arm /goal under the fork's new sessionId. The branched JSONL
-        // is a verbatim copy of the parent's, so an active goal sentinel
-        // carries over — but `config.startNewSession` rebuilt the hook
-        // system under `newSessionId`, leaving the parent's `activeGoal`
-        // store entry stale and the Stop hook unregistered. Same rationale
-        // as the /resume path; see [[useResumeCommand]] for details.
-        try {
-          restoreGoalFromHistory(
-            uiHistoryItems,
-            config,
-            historyManager.addItem,
-          );
-        } catch {
-          // Best-effort — branch must not fail on goal restoration.
-        }
-
-        // 10. Apply the already-persisted title to the prompt bar.
+        // 9. Apply the already-persisted title to the prompt bar.
         setSessionName?.(effectiveTitle);
 
         // Refresh terminal UI.
@@ -290,6 +302,7 @@ export function useBranchCommand(
       config,
       historyManager,
       startNewSession,
+      clearPendingState,
       setSessionName,
       remount,
       options.settings.merged.ui?.history?.collapseOnResume,

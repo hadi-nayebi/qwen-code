@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ACPToolCall, PermissionRequest } from '../../../adapters/types';
+import { hasActiveAgents } from '../../../adapters/toolClassification';
 import { useI18n } from '../../../i18n';
+import { useSubagentDetails } from '../../../subagentDetailsContext';
 import {
   formatElapsed,
   formatLiveElapsed,
@@ -15,6 +17,8 @@ import {
   formatTokenCount,
   getAgentCancellationReason,
   getAgentDisplayStatus,
+  isActiveToolStatus,
+  localizeAgentTypeName,
   toolContainsCallId,
 } from '../toolFormatting';
 import { SubAgentPanel } from './SubAgentPanel';
@@ -67,7 +71,7 @@ export function computeAgentsTimeline(
     starts.push(agent.startTime);
   }
   const ends = agents.map((agent, i) =>
-    agent.status === 'in_progress'
+    isActiveToolStatus(agent.status)
       ? Math.max(now, starts[i])
       : Math.max(agent.endTime ?? starts[i], starts[i]),
   );
@@ -84,7 +88,7 @@ export function computeAgentsTimeline(
     rows.set(agent.callId, {
       leftPct: left * 100,
       widthPct: width * 100,
-      running: agent.status === 'in_progress',
+      running: isActiveToolStatus(agent.status),
     });
   });
 
@@ -160,25 +164,45 @@ export function ParallelAgentsGroup({
   pendingApproval,
 }: ParallelAgentsGroupProps) {
   const { t } = useI18n();
+  const subagentDetails = useSubagentDetails();
   const [groupExpanded, setGroupExpanded] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const liveStartedAtRef = useRef(Date.now());
 
-  const hasRunning = agents.some((a) => a.status === 'in_progress');
+  const hasActive = hasActiveAgents(agents);
+  const activeStartedAt = agents.reduce<number | undefined>(
+    (earliest, agent) => {
+      if (
+        !isActiveToolStatus(agent.status) ||
+        typeof agent.startTime !== 'number'
+      ) {
+        return earliest;
+      }
+      return earliest === undefined
+        ? agent.startTime
+        : Math.min(earliest, agent.startTime);
+    },
+    undefined,
+  );
+
+  const wasActiveRef = useRef(false);
+  useEffect(() => {
+    // Latch the anchor on the false->true edge: re-anchoring while agents
+    // finish would rewind the header clock to a later start time.
+    if (hasActive && !wasActiveRef.current) {
+      liveStartedAtRef.current = activeStartedAt ?? Date.now();
+      setNow(Date.now());
+    }
+    wasActiveRef.current = hasActive;
+  }, [activeStartedAt, hasActive]);
 
   useEffect(() => {
-    if (!hasRunning) return;
-    liveStartedAtRef.current = Date.now();
-    setNow(Date.now());
-  }, [hasRunning]);
-
-  useEffect(() => {
-    if (!hasRunning) return;
+    if (!hasActive) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [hasRunning]);
-  const runningDuration = hasRunning
+  }, [hasActive]);
+  const runningDuration = hasActive
     ? formatLiveElapsed(now - liveStartedAtRef.current)
     : '';
 
@@ -196,7 +220,7 @@ export function ParallelAgentsGroup({
     (a) => getAgentDisplayStatus(a) === 'failed',
   )
     ? 'failed'
-    : hasRunning
+    : hasActive
       ? 'in_progress'
       : 'completed';
 
@@ -220,7 +244,7 @@ export function ParallelAgentsGroup({
         )}
         <span
           className={
-            hasRunning
+            hasActive
               ? `${styles.summaryText} ${styles.summaryTextActive}`
               : styles.summaryText
           }
@@ -248,15 +272,21 @@ export function ParallelAgentsGroup({
               const track = timeline?.rows.get(agent.callId);
               return (
                 <div key={agent.callId}>
-                  <div
+                  <button
+                    type="button"
                     className={styles.row}
-                    onClick={() =>
-                      setExpandedId(isExpanded ? null : agent.callId)
-                    }
+                    aria-expanded={subagentDetails ? undefined : isExpanded}
+                    onClick={() => {
+                      if (subagentDetails) subagentDetails.onOpen(agent);
+                      else setExpandedId(isExpanded ? null : agent.callId);
+                    }}
                   >
                     <StatusIcon status={status} />
                     <span className={styles.rowDesc}>
-                      {truncateText(desc || agentType, 50)}
+                      {truncateText(
+                        desc || localizeAgentTypeName(agentType, t),
+                        50,
+                      )}
                       {toolHint && (
                         <span
                           className={styles.rowTool}
@@ -264,7 +294,7 @@ export function ParallelAgentsGroup({
                       )}
                     </span>
                     {stats && <span className={styles.rowStats}>{stats}</span>}
-                  </div>
+                  </button>
                   {track && (
                     <div className={styles.track} aria-hidden="true">
                       <span
@@ -280,7 +310,7 @@ export function ParallelAgentsGroup({
                       />
                     </div>
                   )}
-                  {isExpanded && (
+                  {!subagentDetails && isExpanded && (
                     <div className={styles.detail}>
                       <SubAgentPanel tool={agent} hideHeader />
                     </div>

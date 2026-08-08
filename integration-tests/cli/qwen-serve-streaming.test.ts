@@ -21,10 +21,13 @@
  *   3. SSE consumer disconnects after seeing N events; reconnect with
  *      `Last-Event-ID: N` resumes the stream from id N+1 via the bus's
  *      replay ring.
+ *   4. An admitted prompt keeps running with no SSE subscriber while the Todo
+ *      Stop Guard performs its bounded continuations; a later subscriber
+ *      replays each discrete status event.
  *
  */
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,7 +49,6 @@ const CLI_BIN =
   process.env['TEST_CLI_PATH'] ??
   path.resolve(__dirname, '../../packages/cli/dist/index.js');
 const TOKEN = 'streaming-integ-secret';
-const REPO_ROOT = path.resolve(__dirname, '../..');
 
 // Windows: this suite shells out to `pgrep` / `kill -KILL` to simulate
 // child-process crashes for the SIGKILL → `session_died` test, and those
@@ -75,6 +77,7 @@ let base = '';
 let client: DaemonClient;
 let fakeServer: FakeOpenAIServer;
 let homeDir = '';
+let workspaceDir = '';
 let pendingWritePath = '';
 
 beforeAll(async () => {
@@ -83,6 +86,27 @@ beforeAll(async () => {
     const messages = JSON.stringify(body['messages'] ?? []);
     const hasToolResult =
       messages.includes('"role":"tool"') || messages.includes('"tool_call_id"');
+
+    const guardMarker = messages.match(/todo-guard-e2e-\d+/g)?.at(-1);
+    if (guardMarker) {
+      const guardTodoId = `${guardMarker}-item`;
+      if (!messages.includes(guardTodoId)) {
+        return {
+          toolCalls: [
+            fakeToolCall('todo_write', {
+              todos: [
+                {
+                  id: guardTodoId,
+                  content: 'Keep this item unfinished for the guard test',
+                  status: 'pending',
+                },
+              ],
+            }),
+          ],
+        };
+      }
+      return { content: 'The test Todo remains unfinished.' };
+    }
 
     if (pendingWritePath && messages.includes('fan-out') && !hasToolResult) {
       return {
@@ -98,6 +122,16 @@ beforeAll(async () => {
     return { content: 'fake response complete' };
   });
   homeDir = mkdtempSync(path.join(tmpdir(), 'qwen-serve-streaming-home-'));
+  const qwenHome = path.join(homeDir, '.qwen');
+  mkdirSync(qwenHome, { recursive: true });
+  writeFileSync(
+    path.join(qwenHome, 'settings.json'),
+    JSON.stringify({
+      experimental: { todoStopGuard: true },
+      ui: { enableFollowupSuggestions: false },
+    }),
+  );
+  workspaceDir = mkdtempSync(path.join(tmpdir(), 'qwen-serve-streaming-ws-'));
   daemon = spawn(
     process.execPath,
     [
@@ -110,16 +144,19 @@ beforeAll(async () => {
       '--hostname',
       '127.0.0.1',
       // Per #3803 §02 (1 daemon = 1 workspace), pin the bound
-      // workspace so every `createOrAttachSession({ workspaceCwd:
-      // REPO_ROOT })` below matches. Without this the daemon inherits
-      // the test runner's cwd (CI / IDE-launcher / direct vitest
-      // invocations all differ) and every session create returns
-      // 400 workspace_mismatch — the SSE / permission / Last-Event-ID
-      // tests below would all silently 404. Same fix the sibling routes test
-      // received earlier in this PR — missed in this file in the original §02
-      // pass.
+      // workspace so every `createOrAttachSession({ workspaceCwd })`
+      // below matches. Without this the daemon inherits the test
+      // runner's cwd (CI / IDE-launcher / direct vitest invocations
+      // all differ) and every session create returns 400
+      // workspace_mismatch — the SSE / permission / Last-Event-ID
+      // tests below would all silently 404. A scratch workspace (not
+      // the checkout) also keeps sessions hermetic: the daemon merges
+      // the workspace's `.qwen/settings.json` into every session, and
+      // a stray one on a shared runner (e.g. a `tools.sandbox` mode or
+      // a `tools.core` allowlist missing `todo_write`) silently breaks
+      // the Stop Guard flow below.
       '--workspace',
-      REPO_ROOT,
+      workspaceDir,
     ],
     {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -178,6 +215,9 @@ afterAll(async () => {
   if (homeDir) {
     rmSync(homeDir, { recursive: true, force: true });
   }
+  if (workspaceDir) {
+    rmSync(workspaceDir, { recursive: true, force: true });
+  }
 }, 15_000);
 
 /** Open an authenticated SSE stream and yield parsed frames. */
@@ -208,7 +248,7 @@ async function* sseFrames(
 describePOSIX('qwen serve — child-crash recovery (real SIGKILL)', () => {
   it('publishes session_died after the qwen --acp child is SIGKILL-ed', async () => {
     const session = await client.createOrAttachSession({
-      workspaceCwd: REPO_ROOT,
+      workspaceCwd: workspaceDir,
     });
 
     // Find the daemon's direct `--acp` child PID.
@@ -262,7 +302,7 @@ describePOSIX('qwen serve — child-crash recovery (real SIGKILL)', () => {
     );
 
     // Listing must NOT show the dead session.
-    const remaining = await client.listWorkspaceSessions(REPO_ROOT);
+    const remaining = await client.listWorkspaceSessions(workspaceDir);
     // Explicit `s` type for resilience against a stale dist .d.ts
     // in the reviewer's tsc env (see same note in routes.test.ts).
     expect(
@@ -273,7 +313,7 @@ describePOSIX('qwen serve — child-crash recovery (real SIGKILL)', () => {
 
     // Retry must spawn fresh, not reuse the corpse.
     const fresh = await client.createOrAttachSession({
-      workspaceCwd: REPO_ROOT,
+      workspaceCwd: workspaceDir,
     });
     expect(fresh.sessionId).not.toBe(session.sessionId);
     expect(fresh.attached).toBe(false);
@@ -283,7 +323,7 @@ describePOSIX('qwen serve — child-crash recovery (real SIGKILL)', () => {
 describePOSIX('qwen serve — multi-client first-responder permission', () => {
   it('fans out permission_request to both subscribers; only one vote wins', async () => {
     const session = await client.createOrAttachSession({
-      workspaceCwd: REPO_ROOT,
+      workspaceCwd: workspaceDir,
     });
 
     // Pin the session to `default` approval mode. The ACP child
@@ -415,7 +455,7 @@ describePOSIX('qwen serve — multi-client first-responder permission', () => {
 describePOSIX('qwen serve — Last-Event-ID resume', () => {
   it('reconnect with Last-Event-ID:N yields events with id > N', async () => {
     const session = await client.createOrAttachSession({
-      workspaceCwd: REPO_ROOT,
+      workspaceCwd: workspaceDir,
     });
 
     // Fire a short prompt to populate the bus.
@@ -455,5 +495,65 @@ describePOSIX('qwen serve — Last-Event-ID resume', () => {
     expect(resumedFirst).toBeDefined();
     expect(resumedFirst!.id).toBeDefined();
     expect(resumedFirst!.id!).toBeGreaterThan(lastId);
+  }, 60_000);
+});
+
+describePOSIX('qwen serve — daemon Todo Stop Guard replay', () => {
+  it('continues after prompt admission without an SSE client and replays the bounded attempts', async () => {
+    const session = await client.createOrAttachSession({
+      workspaceCwd: workspaceDir,
+    });
+    const requestStart = fakeServer.requests.length;
+    const guardMarker = `todo-guard-e2e-${requestStart}`;
+    const accepted = await client.promptNonBlocking(session.sessionId, {
+      prompt: [{ type: 'text', text: guardMarker }],
+    });
+    expect('promptId' in accepted).toBe(true);
+    if (!('promptId' in accepted)) return;
+
+    await expect
+      .poll(
+        () =>
+          fakeServer.requests
+            .slice(requestStart)
+            .filter((request) =>
+              JSON.stringify(request.body['messages'] ?? []).includes(
+                guardMarker,
+              ),
+            ).length,
+        { timeout: 30_000 },
+      )
+      .toBe(4);
+
+    const events: DaemonEvent[] = [];
+    const ac = new AbortController();
+    for await (const event of sseFrames(session.sessionId, {
+      lastEventId: accepted.lastEventId,
+      signal: ac.signal,
+    })) {
+      events.push(event);
+      if (event.type === 'turn_complete') break;
+    }
+    ac.abort();
+
+    const guardUpdates = events.filter((event) => {
+      if (event.type !== 'session_update') return false;
+      const update = (event.data as { update?: Record<string, unknown> })
+        .update;
+      const meta = update?.['_meta'] as Record<string, unknown> | undefined;
+      return meta?.['source'] === 'todo_stop_guard';
+    });
+    expect(guardUpdates).toHaveLength(3);
+    expect(
+      guardUpdates.map((event) => {
+        const update = (event.data as { update: Record<string, unknown> })
+          .update;
+        return (update['_meta'] as Record<string, unknown>)['attempt'];
+      }),
+    ).toEqual([1, 2, 2]);
+    expect(events.some((event) => event.type === 'turn_complete')).toBe(true);
+    expect(JSON.stringify(guardUpdates)).not.toContain(
+      'Keep this item unfinished for the guard test',
+    );
   }, 60_000);
 });

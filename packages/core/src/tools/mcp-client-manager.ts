@@ -40,6 +40,7 @@ import {
   McpServerSpawnFailedError,
   InvalidMcpConfigError,
 } from './mcp-errors.js';
+import { listDescendantPids, sigtermPids } from './pid-descendants.js';
 
 const debugLogger = createDebugLogger('MCP');
 export const RUNTIME_MCP_IF_ABSENT_CONFIG_FLAG = '__qwenRuntimeMcpIfAbsent';
@@ -701,6 +702,16 @@ export class McpClientManager {
     };
   }
 
+  /** Returns this manager's status for a server without consulting the
+   * process-wide compatibility status registry. */
+  getServerStatus(serverName: string): MCPServerStatus {
+    return (
+      this.pooledConnections.get(serverName)?.client.getStatus() ??
+      this.clients.get(serverName)?.getStatus() ??
+      MCPServerStatus.DISCONNECTED
+    );
+  }
+
   /** Resolved budget mode (env-var or constructor-supplied). */
   getMcpBudgetMode(): McpBudgetMode {
     return this.budgetMode;
@@ -1024,6 +1035,20 @@ export class McpClientManager {
   }
 
   /**
+   * Single source of truth for the effective server map: the configured
+   * servers plus the `mcpServerCommand`-derived `mcp` server, each stamped
+   * with the session target dir as its cwd. Every discovery entry point
+   * resolves servers through here so the recipe cannot diverge.
+   */
+  private getEffectiveMcpServers(): Record<string, MCPServerConfig> {
+    return populateMcpServerCommand(
+      this.cliConfig.getMcpServers() || {},
+      this.cliConfig.getMcpServerCommand(),
+      this.cliConfig.getTargetDir(),
+    );
+  }
+
+  /**
    * Initiates the tool discovery process for all configured MCP servers.
    * It connects to each server, discovers its available tools, and registers
    * them with the `ToolRegistry`.
@@ -1045,10 +1070,7 @@ export class McpClientManager {
     }
     await this.stop();
 
-    const servers = populateMcpServerCommand(
-      this.cliConfig.getMcpServers() || {},
-      this.cliConfig.getMcpServerCommand(),
-    );
+    const servers = this.getEffectiveMcpServers();
 
     // mark the bulk pass active
     // so per-server `emitRefusedBatchIfAny` calls (which the inner
@@ -1212,10 +1234,7 @@ export class McpClientManager {
     serverName: string,
     cliConfig: Config,
   ): Promise<void> {
-    const servers = populateMcpServerCommand(
-      this.cliConfig.getMcpServers() || {},
-      this.cliConfig.getMcpServerCommand(),
-    );
+    const servers = this.getEffectiveMcpServers();
     const serverConfig = servers[serverName];
     if (!serverConfig) {
       return;
@@ -1250,10 +1269,7 @@ export class McpClientManager {
     serverName: string,
     cliConfig: Config,
   ): Promise<void> {
-    const servers = populateMcpServerCommand(
-      this.cliConfig.getMcpServers() || {},
-      this.cliConfig.getMcpServerCommand(),
-    );
+    const servers = this.getEffectiveMcpServers();
     const serverConfig = servers[serverName];
     if (!serverConfig) {
       return;
@@ -1550,10 +1566,7 @@ export class McpClientManager {
       const sessionId = this.cliConfig.getSessionId();
       const promptRegistry = this.cliConfig.getPromptRegistry();
       const resourceRegistry = this.cliConfig.getResourceRegistry();
-      const servers = populateMcpServerCommand(
-        this.cliConfig.getMcpServers() || {},
-        this.cliConfig.getMcpServerCommand(),
-      );
+      const servers = this.getEffectiveMcpServers();
       // diff against the
       // current `pooledConnections` instead of releasing all then
       // re-acquiring everything. Pre-fix every incremental discovery
@@ -2107,10 +2120,7 @@ export class McpClientManager {
       return this.discoverAllMcpToolsViaPool(cliConfig);
     }
 
-    const servers = populateMcpServerCommand(
-      this.cliConfig.getMcpServers() || {},
-      this.cliConfig.getMcpServerCommand(),
-    );
+    const servers = this.getEffectiveMcpServers();
 
     // suppress per-server
     // length-1 batches inside this incremental pass — the
@@ -2382,6 +2392,34 @@ export class McpClientManager {
         const client = this.clients.get(serverName);
         if (client) {
           try {
+            const rootPid = client.getTransportPid?.();
+            if (rootPid !== undefined) {
+              const descendants = await listDescendantPids(rootPid);
+              if (descendants.length > 0) {
+                const signaled = sigtermPids(descendants);
+                debugLogger.debug(
+                  `Sent SIGTERM to ${signaled}/${descendants.length} descendants ` +
+                    `of pid ${rootPid} for timed-out server '${serverName}'`,
+                );
+                if (signaled < descendants.length) {
+                  debugLogger.warn(
+                    `Partial signal for timed-out server '${serverName}': ` +
+                      `${signaled}/${descendants.length} descendants of pid ${rootPid} signaled. ` +
+                      'Remaining processes may leak.',
+                  );
+                }
+              }
+            } else {
+              debugLogger.debug(
+                `Skipping descendant pid sweep for timed-out server '${serverName}': transport pid unavailable`,
+              );
+            }
+          } catch (err) {
+            debugLogger.warn(
+              `Descendant pid sweep for timed-out server '${serverName}' threw: ${getErrorMessage(err)}. Proceeding with disconnect.`,
+            );
+          }
+          try {
             await client.disconnect();
           } catch (err) {
             debugLogger.debug(
@@ -2582,10 +2620,7 @@ export class McpClientManager {
     uri: string,
     options?: { signal?: AbortSignal },
   ): Promise<ReadResourceResult> {
-    const servers = populateMcpServerCommand(
-      this.cliConfig.getMcpServers() || {},
-      this.cliConfig.getMcpServerCommand(),
-    );
+    const servers = this.getEffectiveMcpServers();
     const serverConfig = servers[serverName];
     if (this.cliConfig.isMcpServerDisabled(serverName)) {
       throw new Error(`MCP server '${serverName}' is disabled.`);
