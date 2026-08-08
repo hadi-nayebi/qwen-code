@@ -7,11 +7,22 @@
 import type { ServeProtocolVersions } from './capabilities.js';
 import type { AcpHttpHandle, AcpHttpSnapshot } from './acp-http/index.js';
 import type { DeviceFlowRegistry } from './auth/device-flow.js';
-import type { DaemonLogger } from './daemon-logger.js';
+import type {
+  DaemonLogger,
+  DaemonLogHealth,
+  DaemonLogIssue,
+  DaemonLogMode,
+} from './daemon-logger.js';
 import type {
   AcpSessionBridge,
   BridgeDaemonStatusSnapshot,
 } from './acp-session-bridge.js';
+import {
+  MAX_CHILD_HEAP_MB,
+  MIN_CHILD_HEAP_MB,
+  recommendedChildShareMb,
+  type DaemonMemoryBudget,
+} from '@qwen-code/acp-bridge/daemonMemoryBudget';
 import { isLoopbackBind } from './loopback-binds.js';
 import type { RateLimiterInstance, RateLimitTier } from './rate-limit.js';
 import type { ServeOptions } from './types.js';
@@ -76,7 +87,8 @@ export interface DaemonStatusIssue {
     | 'channel_worker_exited'
     | 'channel_worker_partial_connect'
     | 'daemon_runtime_starting'
-    | 'daemon_runtime_failed';
+    | 'daemon_runtime_failed'
+    | 'daemon_log_degraded';
   severity: IssueSeverity;
   message: string;
   section?: string;
@@ -156,11 +168,77 @@ interface DaemonStatusLimits {
   listenerMaxConnections: number | null;
   eventRingSize: number;
   compactedReplayMaxBytes: number;
+  maxJournalEvents: number;
+  maxJournalBytes: number;
   promptDeadlineMs: number | null;
   writerIdleTimeoutMs: number | null;
   channelIdleTimeoutMs: number;
   sessionIdleTimeoutMs: number;
   acpConnectionCap: number | null;
+  /**
+   * The daemon's resolved memory figures. Observed and reported only: nothing
+   * consumes them to size a child. `null` on paths that resolve none, such as
+   * direct-embed bridges.
+   */
+  memory: DaemonStatusMemoryLimits | null;
+}
+
+export interface DaemonStatusMemoryLimits {
+  /**
+   * False, and required. Every figure in this section is resolved input or a
+   * model of a policy that does not exist yet; nothing here is applied to a
+   * process. The flag exists so a client can never mistake the `limits`
+   * namespace for enforcement that has not shipped.
+   */
+  enforced: false;
+  /** What was asked for: the flag value, or half of available memory. */
+  configuredBudgetMb: number;
+  /** `configured` capped at resolved cgroup/host memory. */
+  effectiveBudgetMb: number;
+  budgetSource: 'flag' | 'derived';
+  /** Cgroup limit when one applies, otherwise host total. */
+  availableMemoryMb: number;
+  availableMemorySource: 'constrained' | 'host';
+  insufficientMemory: boolean;
+  /**
+   * Derived figures for a capacity policy that has not shipped. Grouped, and
+   * named for what they are, so they cannot read as memory already reserved or
+   * limits already applied.
+   */
+  modeled: {
+    rootReserveMb: number;
+    childPoolMb: number;
+    minChildHeapMb: number;
+    maxChildHeapMb: number;
+    /**
+     * A conservative model of the ceiling an ACP child receives today, with no
+     * budget involved. Re-derived rather than observed, so it can sit below
+     * the figure a child actually receives (see the spawn-path divergences).
+     */
+    legacyChildCeilingMb: number;
+  };
+}
+
+export function toDaemonStatusMemoryLimits(
+  budget: DaemonMemoryBudget | undefined,
+): DaemonStatusMemoryLimits | null {
+  if (!budget) return null;
+  return {
+    enforced: false,
+    configuredBudgetMb: budget.configuredBudgetMb,
+    effectiveBudgetMb: budget.effectiveBudgetMb,
+    budgetSource: budget.budgetSource,
+    availableMemoryMb: budget.availableMemoryMb,
+    availableMemorySource: budget.availableMemorySource,
+    insufficientMemory: budget.insufficientMemory,
+    modeled: {
+      rootReserveMb: budget.rootReserveMb,
+      childPoolMb: budget.childPoolMb,
+      minChildHeapMb: MIN_CHILD_HEAP_MB,
+      maxChildHeapMb: MAX_CHILD_HEAP_MB,
+      legacyChildCeilingMb: budget.legacyChildCeilingMb,
+    },
+  };
 }
 
 interface DaemonStatusRuntime {
@@ -195,6 +273,14 @@ interface DaemonStatusRuntime {
     enabled: boolean;
     rejectedSinceStart: Record<RateLimitTier, number>;
   };
+  /**
+   * Live counts against the resolved memory budget, and what a per-child share
+   * would come to at each count. The shares are advisory: nothing applies
+   * them, and the gap between the registered and live figures is the reason a
+   * capacity policy has to key on live children rather than registrations.
+   * Absent when no budget resolved.
+   */
+  memory?: DaemonStatusRuntimeMemory;
   perf?: DaemonPerfSnapshot;
   /**
    * Rolling per-interval activity series backing the Daemon Status charts
@@ -211,6 +297,47 @@ interface DaemonStatusRuntime {
     idleSinceMs: number | null;
   };
   process: NodeJS.MemoryUsage;
+}
+
+interface DaemonStatusRuntimeMemory {
+  /**
+   * Registration count: every non-removed workspace entry, including ones
+   * mid-drain, mid-replacement, or blocked. Registration is not allocation, so
+   * this can exceed the live child count and is unsafe to divide the pool by.
+   */
+  registeredWorkspaces: number;
+  /**
+   * Daemon-managed ACP children with a live (non-dying) channel, including
+   * transitioning or blocked entries. Excludes a workspace whose kill has
+   * started (dying channel) even if the child process has not exited yet.
+   * Deliberately narrow — it also excludes channel workers, MCP descendants,
+   * and spawn reservations that have not attached, so a later admission policy
+   * cannot mistake it for a process-tree count. Such a policy will additionally
+   * need an in-flight spawn count to admit without racing.
+   */
+  activeAcpChildren: number;
+  /**
+   * Which children the daemon's RSS sampling actually covers. Only the primary
+   * ACP child is sampled today, so this section must not be read as
+   * process-tree observation. Sampling is gated on an active SSE/WS watcher;
+   * when no client is observing, childRssBytes reads 0 even for the primary.
+   * The drop is not instant: after the last watcher detaches, the last sampled
+   * value persists until it ages out of the staleness window (~30s).
+   */
+  childRssCoverage: 'primary_only';
+  /**
+   * Modeled per-child shares. Advisory; nothing applies them. Each is capped
+   * at the legacy child ceiling, and floored at the minimum child heap only
+   * when the ceiling allows — on a small host the ceiling sits below the
+   * floor, so share x count can exceed the child pool. Read a share as
+   * advisory, not a partition of the pool.
+   */
+  modeled: {
+    /** `null` when no workspace is registered — there is no share to divide. */
+    recommendedShareAtRegisteredMb: number | null;
+    /** `null` when no ACP child is active — there is no share to divide. */
+    recommendedShareAtActiveMb: number | null;
+  };
 }
 
 export interface DaemonPipeStatsSnapshot {
@@ -249,12 +376,19 @@ export interface DaemonStatusResponse {
     uptimeMs: number;
     mode: ServeOptions['mode'];
     workspaceCwd: string;
+    runId?: string;
+    logMode?: DaemonLogMode;
+    logHealth?: DaemonLogHealth;
+    logIssues?: readonly DaemonLogIssue[];
+    logDroppedRecords?: number;
+    logDroppedBytes?: number;
   };
   security: DaemonStatusSecurity;
   limits: DaemonStatusLimits;
   workspaces?: Array<{
     id: string;
     cwd: string;
+    displayName?: string;
     primary: boolean;
     trusted: boolean;
   }>;
@@ -290,6 +424,7 @@ export async function buildDaemonStatusResponse(
   detail: DaemonStatusDetail,
   input: BuildDaemonStatusOptions,
 ): Promise<DaemonStatusResponse> {
+  const daemonLogStatus = input.daemonLog?.getStatus();
   const bridgeSnapshot = input.bridge.getDaemonStatusSnapshot();
   const lastActivity = input.bridge.lastActivityAt ?? null;
   const workspaceRuntimes = input.workspaceRegistry?.list();
@@ -322,6 +457,41 @@ export async function buildDaemonStatusResponse(
   const aggregatedChannelLive = workspaceSnapshots.some(
     (item) => item.snapshot.channelLive,
   );
+  const memoryBudget = input.opts.daemonMemoryBudget;
+  let runtimeMemory: DaemonStatusRuntimeMemory | undefined;
+  if (memoryBudget) {
+    // Count managed runtimes whose channel is live (non-dying), not what is
+    // merely active-state. `list()` (active-state only) drops workspaces
+    // mid-replacement or blocked, which would under-report children in exactly
+    // the window an admission policy must not treat as free capacity.
+    // `listManaged()` is the managed set; `listEntries()` is the registration
+    // count. A workspace whose kill has started but whose child has not exited
+    // is excluded (dying channel); registered-but-dormant workspaces have no
+    // live child, so the registered count remains unsafe to divide by.
+    const managedRuntimes = input.workspaceRegistry?.listManaged();
+    const activeAcpChildCount = managedRuntimes
+      ? managedRuntimes.filter((runtime) => runtime.bridge.isChannelLive())
+          .length
+      : workspaceSnapshots.filter((item) => item.snapshot.channelLive).length;
+    const registeredWorkspaceCount = input.workspaceRegistry
+      ? input.workspaceRegistry.listEntries().length
+      : workspaceSnapshots.length;
+    runtimeMemory = {
+      registeredWorkspaces: registeredWorkspaceCount,
+      activeAcpChildren: activeAcpChildCount,
+      childRssCoverage: 'primary_only',
+      modeled: {
+        recommendedShareAtRegisteredMb:
+          registeredWorkspaceCount > 0
+            ? recommendedChildShareMb(memoryBudget, registeredWorkspaceCount)
+            : null,
+        recommendedShareAtActiveMb:
+          activeAcpChildCount > 0
+            ? recommendedChildShareMb(memoryBudget, activeAcpChildCount)
+            : null,
+      },
+    };
+  }
   const aggregatedLastActivity = workspaceSnapshots.reduce<number | null>(
     (latest, item) =>
       item.lastActivity !== null &&
@@ -389,6 +559,14 @@ export async function buildDaemonStatusResponse(
     totalAdmissionSnapshot,
     workspaceSnapshots,
   );
+  if (daemonLogStatus?.health === 'degraded') {
+    issues.push({
+      code: 'daemon_log_degraded',
+      severity: 'warning',
+      message:
+        'Daemon file logging is degraded; inspect full status for details.',
+    });
+  }
 
   if (detail === 'full') {
     full = await buildFullStatus(
@@ -417,8 +595,22 @@ export async function buildDaemonStatusResponse(
       ...(input.daemonLog?.getDaemonId()
         ? { daemonId: input.daemonLog.getDaemonId() }
         : {}),
+      ...(daemonLogStatus
+        ? {
+            runId: daemonLogStatus.runId,
+            logMode: daemonLogStatus.mode,
+            logHealth: daemonLogStatus.health,
+          }
+        : {}),
       ...(detail === 'full' && input.daemonLog?.getLogPath()
         ? { logPath: input.daemonLog.getLogPath() }
+        : {}),
+      ...(detail === 'full' && daemonLogStatus
+        ? {
+            logIssues: daemonLogStatus.issues,
+            logDroppedRecords: daemonLogStatus.droppedRecords,
+            logDroppedBytes: daemonLogStatus.droppedBytes,
+          }
         : {}),
     },
     security: {
@@ -439,17 +631,23 @@ export async function buildDaemonStatusResponse(
       listenerMaxConnections: listenerMaxConnections(input.opts.maxConnections),
       eventRingSize: bridgeSnapshot.limits.eventRingSize,
       compactedReplayMaxBytes: bridgeSnapshot.limits.compactedReplayMaxBytes,
+      maxJournalEvents: bridgeSnapshot.limits.maxJournalEvents,
+      maxJournalBytes: bridgeSnapshot.limits.maxJournalBytes,
       promptDeadlineMs: positiveFiniteOrNull(input.opts.promptDeadlineMs),
       writerIdleTimeoutMs: positiveFiniteOrNull(input.opts.writerIdleTimeoutMs),
       channelIdleTimeoutMs: bridgeSnapshot.limits.channelIdleTimeoutMs,
       sessionIdleTimeoutMs: bridgeSnapshot.limits.sessionIdleTimeoutMs,
       acpConnectionCap: acpSnapshot?.connectionCap ?? null,
+      memory: toDaemonStatusMemoryLimits(memoryBudget),
     },
     ...(workspaceRuntimes && workspaceRuntimes.length > 1
       ? {
           workspaces: workspaceRuntimes.map((runtime) => ({
             id: runtime.workspaceId,
             cwd: runtime.workspaceCwd,
+            ...(runtime.displayName !== undefined
+              ? { displayName: runtime.displayName }
+              : {}),
             primary: runtime.primary,
             trusted: runtime.trusted,
           })),
@@ -514,6 +712,7 @@ export async function buildDaemonStatusResponse(
             ? Date.now() - aggregatedLastActivity
             : null,
       },
+      ...(runtimeMemory ? { memory: runtimeMemory } : {}),
       process: process.memoryUsage(),
     },
     ...(full ? { full } : {}),

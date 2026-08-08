@@ -4,14 +4,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type {
-  ChatRecord,
-  Config,
-  HistoryGap,
-  SessionTranscriptCursorState,
-  SessionTranscriptRecordPage,
+import {
+  parseGoalSnapshotV2,
+  type ChatRecord,
+  type Config,
+  type GoalSnapshotV2,
+  type HistoryGap,
+  type SessionTranscriptCursorState,
+  type SessionTranscriptRecordPage,
 } from '@qwen-code/qwen-code-core';
 import type { SessionUpdate } from '@agentclientprotocol/sdk';
+import type { TranscriptReplayStateV1 } from '@qwen-code/acp-bridge/transcriptReplay';
+import { projectAcpToolResultUpdate } from './acp-tool-result-text-projection.js';
 import { HistoryReplayer } from './history-replayer.js';
 import type { PendingReplayToolCall } from './history-replayer.js';
 import type { CumulativeUsage, SessionEmitterContext } from './types.js';
@@ -70,12 +74,26 @@ function isPendingReplayToolCall(
   );
 }
 
+function isCurrentPendingReplayToolCall(
+  value: unknown,
+): value is TranscriptReplayStateV1['pendingToolCalls'][number] {
+  if (!isObjectRecord(value)) return false;
+  return (
+    typeof value['callId'] === 'string' &&
+    typeof value['toolName'] === 'string' &&
+    typeof value['sourceRecordId'] === 'string' &&
+    (value['sourceTimestamp'] === undefined ||
+      typeof value['sourceTimestamp'] === 'string')
+  );
+}
+
 function parseTranscriptReplayState(
   replay: unknown,
   logger?: ReplayLogger,
 ): {
   pendingToolCalls: PendingReplayToolCall[];
   cumulativeUsage: CumulativeUsage;
+  goalState?: GoalSnapshotV2;
 } {
   if (!isObjectRecord(replay)) {
     return {
@@ -83,9 +101,27 @@ function parseTranscriptReplayState(
       cumulativeUsage: createReplayCumulativeUsage(),
     };
   }
+  if ('v' in replay && replay['v'] !== 1) {
+    throw new TypeError('Unsupported transcript replay state version.');
+  }
   const rawPending = replay['pendingToolCalls'];
   const pendingToolCalls = Array.isArray(rawPending)
-    ? rawPending.filter(isPendingReplayToolCall)
+    ? rawPending.flatMap((pending): PendingReplayToolCall[] => {
+        if (isPendingReplayToolCall(pending)) return [pending];
+        if (isCurrentPendingReplayToolCall(pending)) {
+          return [
+            {
+              callId: pending.callId,
+              toolName: pending.toolName,
+              recordId: pending.sourceRecordId,
+              ...(pending.sourceTimestamp
+                ? { timestamp: pending.sourceTimestamp }
+                : {}),
+            },
+          ];
+        }
+        return [];
+      })
     : [];
   if (
     logger &&
@@ -100,7 +136,17 @@ function parseTranscriptReplayState(
   const cumulativeUsage = isCumulativeUsage(replay['cumulativeUsage'])
     ? { ...replay['cumulativeUsage'] }
     : createReplayCumulativeUsage();
-  return { pendingToolCalls, cumulativeUsage };
+  const rawGoalState = replay['goalState'];
+  const goalState =
+    rawGoalState === undefined ? undefined : parseGoalSnapshotV2(rawGoalState);
+  if (logger && rawGoalState !== undefined && !goalState) {
+    logger.warn('[transcript] replay state dropped a malformed Goal state');
+  }
+  return {
+    pendingToolCalls,
+    cumulativeUsage,
+    ...(goalState ? { goalState } : {}),
+  };
 }
 
 function replayContext(
@@ -109,10 +155,24 @@ function replayContext(
   cumulativeUsage: CumulativeUsage,
   config?: Config,
 ): SessionEmitterContext {
+  let activeRecordId: string | null = null;
   return {
     sessionId,
     sendUpdate: async (update) => {
-      updates.push(update);
+      const projectedUpdate = projectAcpToolResultUpdate(update);
+      if (activeRecordId === null) {
+        updates.push(projectedUpdate);
+        return;
+      }
+      const record = projectedUpdate as unknown as Record<string, unknown>;
+      const meta = isObjectRecord(record['_meta']) ? record['_meta'] : {};
+      updates.push({
+        ...record,
+        _meta: { ...meta, 'qwen.session.recordId': activeRecordId },
+      } as unknown as SessionUpdate);
+    },
+    setActiveRecordId: (recordId: string | null) => {
+      activeRecordId = recordId;
     },
     cumulativeUsage,
     ...(config ? { config } : {}),
@@ -126,6 +186,7 @@ export async function collectHistoryReplayUpdates({
   gaps,
   cumulativeUsage,
   logger,
+  supersedeUnrestorableGoal,
 }: {
   sessionId: string;
   config?: Config;
@@ -133,11 +194,18 @@ export async function collectHistoryReplayUpdates({
   gaps?: HistoryGap[];
   cumulativeUsage: CumulativeUsage;
   logger?: ReplayLogger;
+  /**
+   * Forwarded to `HistoryReplayer`. Only the resume path, where
+   * `#restoreGoalOnResume` follows, sets this. Reading another session's
+   * history must render it as it was, not editorialize a goal it won't restore.
+   */
+  supersedeUnrestorableGoal?: boolean;
 }): Promise<{ updates: SessionUpdate[]; replayError?: string }> {
   const updates: SessionUpdate[] = [];
   try {
     await new HistoryReplayer(
       replayContext(sessionId, updates, cumulativeUsage, config),
+      { supersedeUnrestorableGoal },
     ).replay(records, gaps);
   } catch (error) {
     const replayError = error instanceof Error ? error.message : String(error);
@@ -181,27 +249,32 @@ export async function replayTranscriptRecordPage({
   config,
   encodeCursor,
   logger,
+  finalizeDangling = true,
 }: {
   sessionId: string;
   page: SessionTranscriptRecordPage;
   config?: Config;
   encodeCursor: (state: SessionTranscriptCursorState) => string;
   logger?: ReplayLogger;
+  finalizeDangling?: boolean;
 }): Promise<ReplayedTranscriptPage> {
   const state = parseTranscriptReplayState(page.replay, logger);
   const updates: SessionUpdate[] = [];
   const replayer = new HistoryReplayer(
     replayContext(sessionId, updates, state.cumulativeUsage, config),
   );
-  let pendingToolCalls: PendingReplayToolCall[];
+  let replayState: TranscriptReplayStateV1;
   let replayError: string | undefined;
   try {
-    const replayState = await replayer.replayPage(page.records, {
-      pendingToolCalls: state.pendingToolCalls,
-      finalizeDangling: !page.hasMore,
+    const replayPageState = await replayer.replayPage(page.records, {
+      pendingToolCalls:
+        page.direction === 'backward' ? [] : state.pendingToolCalls,
+      finalizeDangling:
+        finalizeDangling && (page.direction === 'backward' || !page.hasMore),
       gaps: page.gaps,
+      ...(state.goalState ? { goalState: state.goalState } : {}),
     });
-    pendingToolCalls = replayState.pendingToolCalls;
+    replayState = replayPageState.replay;
   } catch (error) {
     logger?.warn(
       '[historyReplay] Paged history replay failed for session %s (partial updates: %d):',
@@ -209,7 +282,7 @@ export async function replayTranscriptRecordPage({
       updates.length,
       error,
     );
-    pendingToolCalls = replayer.getPendingToolCalls();
+    replayState = replayer.getReplayState();
     replayError = 'Replay conversion failed for this page';
   }
 
@@ -217,10 +290,7 @@ export async function replayTranscriptRecordPage({
     page.nextCursorState && replayError === undefined
       ? encodeCursor({
           ...page.nextCursorState,
-          replay: {
-            pendingToolCalls,
-            cumulativeUsage: state.cumulativeUsage,
-          },
+          ...(page.direction === 'backward' ? {} : { replay: replayState }),
         })
       : undefined;
 

@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
@@ -10,9 +11,21 @@ import type {
   DaemonSessionGroup,
   DaemonSessionSummary,
   DaemonWorkspaceCapability,
+  DaemonWorkspaceGitStatus,
 } from '@qwen-code/sdk/daemon';
 import { FolderClosedIcon, FolderOpenIcon } from 'lucide-react';
-import { SESSION_LIST_PAGE_SIZE } from '../../constants/sessions';
+import { GitBranchIndicator } from '../GitBranchIndicator';
+import { BranchPickerPopover } from '../BranchPickerPopover';
+import { useI18n } from '../../i18n';
+import {
+  SESSION_LIST_PAGE_SIZE,
+  WEB_SHELL_SESSION_SOURCE_TYPE,
+} from '../../constants/sessions';
+import {
+  readWorkspaceCollapsedGroupIds,
+  writeWorkspaceCollapsedGroupIds,
+} from './collapsedSessionSections';
+import { workspaceLabel } from '../../utils/workspace';
 import { SessionGroupSection } from './SessionGroupSection';
 import styles from './WorkspaceSection.module.css';
 
@@ -20,9 +33,14 @@ function cx(...classes: Array<string | false | undefined>): string {
   return classes.filter(Boolean).join(' ');
 }
 
-function getWorkspaceName(cwd: string): string {
-  const parts = cwd.split(/[\\/]+/).filter(Boolean);
-  return parts.at(-1) ?? cwd;
+// The cwd-qualified daemon route only accepts a workspace id or absolute path.
+// A synthetic fallback workspace (daemon reports no workspaces and the
+// connection has no cwd) carries a display name in `cwd`, which is neither, so
+// qualifying a request with it would only ever 400.
+function isAbsolutePath(cwd: string): boolean {
+  return (
+    cwd.startsWith('/') || cwd.startsWith('\\') || /^[a-zA-Z]:[\\/]/.test(cwd)
+  );
 }
 
 function getSessionLabel(session: DaemonSessionSummary): string {
@@ -44,16 +62,16 @@ function WorkspaceFolderIcon({ open }: { open: boolean }) {
 
 interface WorkspaceSectionProps {
   workspace: DaemonWorkspaceCapability;
+  renderHeader?: (expanded: boolean) => ReactNode;
   client: DaemonClient;
-  isActive: boolean;
   reloadToken: number;
-  primaryLabel: string;
   untrustedLabel: string;
   readOnlyLabel: string;
   trustToOpenLabel: string;
   noSessionsLabel: string;
   loadErrorLabel: string;
   organizationEnabled: boolean;
+  sourceMetadataEnabled?: boolean;
   ungroupedLabel: string;
   formatTime: (iso: string) => string;
   searchQuery?: string;
@@ -67,10 +85,7 @@ interface WorkspaceSectionProps {
    * type scale, hover actions (pin, archive, export, more…), and states —
    * instead of a bespoke, feature-poor row.
    */
-  renderSession: (
-    session: DaemonSessionSummary,
-    options?: { grouped?: boolean },
-  ) => ReactNode;
+  renderSession: (session: DaemonSessionSummary) => ReactNode;
   headerActions?: (visible: boolean) => ReactNode;
   onRenameGroup?: (group: DaemonSessionGroup, workspaceCwd: string) => void;
   onDeleteGroup?: (group: DaemonSessionGroup, workspaceCwd: string) => void;
@@ -78,20 +93,27 @@ interface WorkspaceSectionProps {
   deleteGroupLabel?: string;
   groupActionsDisabled?: boolean;
   excludePinned?: boolean;
+  /**
+   * Open the working-tree Changes dialog for this workspace. When provided, the
+   * folder header shows a live git chip (branch + dirty/ahead-behind state) that
+   * fires this on click. Omitted for untrusted workspaces (no git surface).
+   */
+  onOpenGitDiff?: (workspaceCwd: string) => void;
+  onOpenCommit?: (workspaceCwd: string) => void;
 }
 
 export function WorkspaceSection({
   workspace,
+  renderHeader,
   client,
-  isActive,
   reloadToken,
-  primaryLabel,
   untrustedLabel,
   readOnlyLabel,
   trustToOpenLabel,
   noSessionsLabel,
   loadErrorLabel,
   organizationEnabled,
+  sourceMetadataEnabled = false,
   ungroupedLabel,
   formatTime,
   searchQuery = '',
@@ -107,15 +129,20 @@ export function WorkspaceSection({
   deleteGroupLabel,
   groupActionsDisabled,
   excludePinned = false,
+  onOpenGitDiff,
+  onOpenCommit,
 }: WorkspaceSectionProps) {
   const [sessions, setSessions] = useState<DaemonSessionSummary[]>([]);
   const [groups, setGroups] = useState<DaemonSessionGroup[]>([]);
   const [loadError, setLoadError] = useState(false);
   const [internalExpanded, setInternalExpanded] = useState(false);
-  const [collapsedGroupIds, setCollapsedGroupIds] = useState<Set<string>>(
-    () => new Set(),
+  const [collapsedGroupIds, setCollapsedGroupIds] = useState<Set<string>>(() =>
+    readWorkspaceCollapsedGroupIds(workspace.id),
   );
   const [actionsVisible, setActionsVisible] = useState(false);
+  const [gitStatus, setGitStatus] = useState<DaemonWorkspaceGitStatus>();
+  const [branchPickerOpen, setBranchPickerOpen] = useState(false);
+  const { t } = useI18n();
   const expanded = controlledExpanded ?? internalExpanded;
   const readOnly = !workspace.primary && !workspace.trusted;
   const disabled = workspace.primary && !workspace.trusted;
@@ -124,6 +151,12 @@ export function WorkspaceSection({
   useEffect(() => {
     if (controlledExpanded === undefined) setInternalExpanded(false);
   }, [controlledExpanded, workspace.id]);
+
+  // The render site keys this component by workspace id, so an id change
+  // always remounts and the lazy useState initializer re-reads storage.
+  useEffect(() => {
+    writeWorkspaceCollapsedGroupIds(workspace.id, collapsedGroupIds);
+  }, [collapsedGroupIds, workspace.id]);
 
   useEffect(() => {
     if (controlledExpanded === undefined && autoExpandKey) {
@@ -139,6 +172,9 @@ export function WorkspaceSection({
         .listWorkspaceSessions({
           pageSize: SESSION_LIST_PAGE_SIZE,
           archiveState: 'active',
+          ...(sourceMetadataEnabled
+            ? { sourceType: WEB_SHELL_SESSION_SOURCE_TYPE }
+            : {}),
           ...(organizationEnabled
             ? { view: 'organized' as const, group: 'all' }
             : {}),
@@ -151,7 +187,13 @@ export function WorkspaceSection({
       console.warn('[WorkspaceSection] session poll failed:', err);
       setLoadError(true);
     }
-  }, [client, disabled, organizationEnabled, workspace.cwd]);
+  }, [
+    client,
+    disabled,
+    organizationEnabled,
+    sourceMetadataEnabled,
+    workspace.cwd,
+  ]);
 
   useEffect(() => {
     if (!renderSessions || disabled || !organizationEnabled) {
@@ -196,6 +238,64 @@ export function WorkspaceSection({
     searchQuery,
   ]);
 
+  // Undefined when `cwd` is not a real path (synthetic fallback workspace), so
+  // the poll — which qualifies the route with the cwd — is skipped entirely.
+  const gitPollCwd = isAbsolutePath(workspace.cwd) ? workspace.cwd : undefined;
+  const gitStatusEnabled = Boolean(onOpenGitDiff);
+
+  // Log a poll failure only on the success→failure transition, not on every
+  // 60s/focus tick, so an unreachable workspace doesn't spam a long-lived tab.
+  const gitPollFailed = useRef(false);
+  const loadGitStatus = useCallback(async () => {
+    if (!gitStatusEnabled || !workspace.trusted || !gitPollCwd) return;
+    try {
+      // wait: the sidebar chip shows the enriched counters and has no SSE
+      // fill-in path, so it keeps the blocking semantics instead of the
+      // composer's last-known fast path.
+      const status = await client
+        .workspaceByCwd(gitPollCwd)
+        .workspaceGit({ wait: true });
+      gitPollFailed.current = false;
+      setGitStatus(status);
+    } catch (err) {
+      // Keep the last known status on a transient failure so a brief network
+      // or daemon blip doesn't blank the chip for a whole poll interval; log
+      // only on the success→failure transition.
+      if (!gitPollFailed.current) {
+        console.warn('[WorkspaceSection] git status poll failed:', err);
+        gitPollFailed.current = true;
+      }
+    }
+  }, [client, gitPollCwd, gitStatusEnabled, workspace.trusted]);
+
+  // The git chip lives in the always-visible folder header, so it polls
+  // independently of session expansion: on mount/trust, on window focus, and on
+  // a visibility-gated 60s tick (the daemon recomputes the working-tree summary
+  // per call, so the cadence stays gentle). Skipped entirely when no diff
+  // handler is wired, since the chip — its only consumer — would not render.
+  useEffect(() => {
+    if (!gitStatusEnabled || !workspace.trusted || !gitPollCwd) {
+      setGitStatus(undefined);
+      return;
+    }
+    void loadGitStatus();
+    const onFocus = () => void loadGitStatus();
+    window.addEventListener('focus', onFocus);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void loadGitStatus();
+    }, 60_000);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      window.clearInterval(timer);
+    };
+  }, [
+    gitPollCwd,
+    gitStatusEnabled,
+    loadGitStatus,
+    reloadToken,
+    workspace.trusted,
+  ]);
+
   const visibleSessions = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     return sessions.filter((session) => {
@@ -229,11 +329,7 @@ export function WorkspaceSection({
   return (
     <div className={styles.section}>
       <div
-        className={cx(
-          styles.headerRow,
-          isActive && styles.headerActive,
-          disabled && styles.headerDisabled,
-        )}
+        className={cx(styles.headerRow, disabled && styles.headerDisabled)}
         onMouseEnter={() => setActionsVisible(true)}
         onMouseLeave={() => setActionsVisible(false)}
         onFocus={() => setActionsVisible(true)}
@@ -254,22 +350,51 @@ export function WorkspaceSection({
             onExpandedChange?.(nextExpanded);
           }}
         >
-          <span className={cx(styles.chevron, expanded && styles.chevronOpen)}>
-            <WorkspaceFolderIcon open={expanded} />
-          </span>
-          <span className={styles.headerContent}>
-            <span className={styles.name}>
-              {getWorkspaceName(workspace.cwd)}
-            </span>
-            {workspace.primary && primaryLabel && (
-              <span className={styles.badge}>{primaryLabel}</span>
-            )}
-          </span>
-          {!workspace.trusted && (
-            <span className={styles.badge}>{untrustedLabel}</span>
+          {renderHeader ? (
+            renderHeader(expanded)
+          ) : (
+            <>
+              <span
+                className={cx(styles.chevron, expanded && styles.chevronOpen)}
+              >
+                <WorkspaceFolderIcon open={expanded} />
+              </span>
+              <span className={styles.headerContent}>
+                <span className={styles.name}>{workspaceLabel(workspace)}</span>
+              </span>
+              {!workspace.trusted && (
+                <span className={styles.badge}>{untrustedLabel}</span>
+              )}
+              {readOnly && (
+                <span className={styles.badge}>{readOnlyLabel}</span>
+              )}
+            </>
           )}
-          {readOnly && <span className={styles.badge}>{readOnlyLabel}</span>}
         </button>
+        {onOpenGitDiff && workspace.trusted && gitStatus?.branch && (
+          <BranchPickerPopover
+            open={branchPickerOpen}
+            onOpenChange={setBranchPickerOpen}
+            workspaceCwd={workspace.cwd}
+            onBranchChanged={() => void loadGitStatus()}
+            onOpenDiff={() => onOpenGitDiff(workspace.cwd)}
+            onOpenCommit={
+              onOpenCommit ? () => onOpenCommit(workspace.cwd) : undefined
+            }
+          >
+            <button
+              type="button"
+              className={styles.gitPill}
+              aria-label={`${t('branchPicker.label')} — ${gitStatus.branch}`}
+            >
+              <GitBranchIndicator
+                branch={gitStatus.branch}
+                status={gitStatus}
+                compact
+              />
+            </button>
+          </BranchPickerPopover>
+        )}
         {headerActions?.(actionsVisible)}
       </div>
       {renderSessions &&
@@ -314,9 +439,7 @@ export function WorkspaceSection({
                     deleteLabel={deleteGroupLabel}
                     actionsDisabled={groupActionsDisabled}
                   >
-                    {sessions.map((session) =>
-                      renderSession(session, { grouped: true }),
-                    )}
+                    {sessions.map((session) => renderSession(session))}
                   </SessionGroupSection>
                 ))}
                 {groupedSessions.ungrouped.length > 0 && (
@@ -335,7 +458,7 @@ export function WorkspaceSection({
                     }}
                   >
                     {groupedSessions.ungrouped.map((session) =>
-                      renderSession(session, { grouped: true }),
+                      renderSession(session),
                     )}
                   </SessionGroupSection>
                 )}
@@ -354,7 +477,9 @@ export function WorkspaceSection({
                     role="note"
                     aria-label={`${label}${time ? `, ${time}` : ''}. ${trustToOpenLabel}`}
                   >
-                    <span className={styles.sessionName}>{label}</span>
+                    <span className={styles.sessionName} title={label}>
+                      {label}
+                    </span>
                     {time && <span className={styles.sessionTime}>{time}</span>}
                   </div>
                 );

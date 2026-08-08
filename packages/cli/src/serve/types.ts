@@ -13,15 +13,22 @@ import {
 // instead of inlining the string literals, so upstream changes
 // are compiler-flagged here.
 import type { PermissionPolicy } from '@qwen-code/acp-bridge';
-import type { AuthType, InputModalities } from '@qwen-code/qwen-code-core';
+import type { DaemonMemoryBudget } from '@qwen-code/acp-bridge/daemonMemoryBudget';
+import type {
+  AuthType,
+  InputModalities,
+  MemoryProjectScope,
+} from '@qwen-code/qwen-code-core';
 
 /**
  * Stage 1 daemon mode shape.
  *
- * `http-bridge` (Stage 1): one `qwen --acp` child per daemon (the
- *   daemon binds to ONE workspace at boot). Multiple
- *   sessions multiplex onto that child via the agent's native
- *   `connection.newSession()` (see `acp-integration/acpAgent.ts:194`),
+ * `http-bridge` (Stage 1): production attempts to preheat the primary
+ *   `qwen --acp` child and retries on first use after failure; trusted
+ *   secondaries start one on demand, while untrusted secondaries do not.
+ *   Multiple sessions in one runtime multiplex onto its child via the
+ *   agent's native `connection.newSession()` (see
+ *   `acp-integration/acpAgent.ts:194`),
  *   sharing the child's process / OAuth / file-cache / hierarchy-memory
  *   parse. The daemon pipes ACP NDJSON over HTTP/SSE. Same-session
  *   multi-client requests serialize through the bridge's per-session
@@ -53,20 +60,28 @@ export interface ServeOptions {
   token?: string;
   mode: ServeMode;
   /**
-   * Cap on concurrent live sessions. Once `bridge.sessionCount` reaches
+   * Per-workspace cap on concurrent live sessions. Once a runtime's
+   * `bridge.sessionCount` reaches
    * this, new `POST /session` requests that would spawn fresh sessions
    * return 503. Attaching to an existing session (same workspace under
    * `sessionScope: 'single'`) still works — so an idle daemon doesn't
-   * block reconnects from existing users. Defaults to 20: comfortably
+   * block reconnects from existing users. Defaults to 32: comfortably
    * above single-user usage, well below the design's N≈50 cliff where
    * per-session RSS (~30–50 MB) and FD pressure start to bite. Set to
    * `0` or `Infinity` to disable.
+   *
+   * This is a fairness and FD lever rather than a memory lever. Sessions
+   * multiplex onto their workspace's single ACP child, so per-session RSS is
+   * spent inside that child's heap, which nothing currently bounds beyond
+   * V8's own ceiling.
    */
   maxSessions?: number;
   /**
    * Non-negative integer cap on concurrent live sessions across all workspace
-   * runtimes. Defaults to unlimited until multi-workspace sessions are ungated.
-   * `0` or `Infinity` disables the cap.
+   * runtimes. `runQwenServe` derives a default once from the per-workspace cap
+   * and startup workspace count when several startup/restored workspaces are
+   * present; direct embeds may leave it unlimited. Dynamic registration does
+   * not recompute it. `0` or `Infinity` disables the cap.
    */
   maxTotalSessions?: number;
   /**
@@ -105,11 +120,22 @@ export interface ServeOptions {
    */
   compactedReplayMaxBytes?: number;
   /**
+   * Per-session cap on the number of raw events retained in the in-flight
+   * live journal. Threaded into `BridgeOptions.maxJournalEvents`. Defaults
+   * to 10 000. Must be a positive safe integer.
+   */
+  maxJournalEvents?: number;
+  /**
+   * Per-session byte cap on the in-flight live journal. Threaded into
+   * `BridgeOptions.maxJournalBytes`. Defaults to 8 MiB. Must be a positive
+   * safe integer.
+   */
+  maxJournalBytes?: number;
+  /**
    * Absolute workspace path this daemon binds as its primary workspace.
-   * The CLI parser accepts repeated `--workspace` values for
-   * sessions-only multi-workspace mode, but this public option remains the
-   * primary workspace string so existing embeds do not need to understand
-   * the internal runtime registry.
+   * The CLI parser accepts repeated `--workspace` values to register isolated
+   * runtimes, but this public option remains the primary workspace string so
+   * existing embeds do not need to understand the internal runtime registry.
    *
    * `POST /session` calls whose `cwd` doesn't canonicalize to this
    * path, or to another registered runtime's canonical workspace, are
@@ -119,6 +145,14 @@ export interface ServeOptions {
    * Defaults to `process.cwd()` when omitted.
    */
   workspace?: string;
+  /**
+   * Project-memory partitioning for every runtime owned by this daemon.
+   * `workspace` keys memory by the exact registered workspace; `git-root`
+   * preserves the legacy behavior that shares memory among workspaces
+   * resolved to the same Git root. When omitted,
+   * `QWEN_CODE_MEMORY_PROJECT_SCOPE` is read from the environment.
+   */
+  memoryProjectScope?: MemoryProjectScope;
   /**
    * When true, refuses to boot without a bearer
    * token — even on loopback. Loopback's no-token developer default
@@ -191,6 +225,31 @@ export interface ServeOptions {
    */
   mcpPoolActive?: boolean;
   /**
+   * Total memory budget in MB for the whole daemon process tree — the root
+   * plus every `qwen --acp` child it spawns. When unset, derived as half of
+   * the cgroup-constrained or host memory. Currently observed and reported
+   * only; it does not yet size any child.
+   */
+  memoryBudgetMb?: number;
+  /**
+   * Resolved at boot by `runQwenServe`. Not an operator input, and not
+   * consumed by any spawn path — it is reported under `limits.memory` on
+   * `GET /daemon/status` so the daemon's memory denominator is observable
+   * before a child-capacity policy is designed against it.
+   */
+  daemonMemoryBudget?: DaemonMemoryBudget;
+  /**
+   * Required external pre-execution policy for managed ACP tools. Omitted
+   * means fully off. The token remains daemon-local and is never forwarded to
+   * the ACP child or any executor environment.
+   */
+  externalToolGuard?: {
+    mode: 'required';
+    endpoint: string;
+    token: string;
+    timeoutMs?: number;
+  };
+  /**
    * Cross-origin allowlist for browser webui
    * deployments.
    */
@@ -217,6 +276,12 @@ export interface ServeOptions {
   sessionReapIntervalMs?: number;
   /** Session idle timeout in ms. 0 = disabled. Default: 1800000 (30 min). */
   sessionIdleTimeoutMs?: number;
+  /**
+   * ACP child request timeout, including the `initialize` handshake,
+   * in ms. Must be a positive
+   * integer. Default: 10000 (10 s).
+   */
+  initializeTimeoutMs?: number;
   /**
    * Wall-clock timeout in ms for a single human permission /
    * ask_user_question response in daemon (ACP) mode. 0 = disabled
@@ -308,13 +373,15 @@ export interface CapabilitiesEnvelope {
    * current server code always populates it.
    */
   workspaceCwd?: string;
-  /** Registered session runtimes. Older single-workspace daemons may omit it. */
+  /** Registered workspace runtimes. Older single-workspace daemons may omit it. */
   workspaces?: Array<{
     id: string;
     cwd: string;
+    displayName?: string;
     primary: boolean;
     trusted: boolean;
     removable?: boolean;
+    kind?: 'live';
   }>;
   /**
    * Transport families this daemon supports. Always includes `'rest'`;

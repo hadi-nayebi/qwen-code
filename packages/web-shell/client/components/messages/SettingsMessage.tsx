@@ -28,6 +28,8 @@ import {
   useI18n,
   type WebShellLanguage,
 } from '../../i18n';
+import { LiveVoiceSettingsCard } from '../../live/LiveVoiceSettingsCard';
+import type { UseLiveVoiceSetupResult } from '../../live/useLiveVoiceSetup';
 import {
   WEB_SHELL_THEMES,
   WebShellThemeId,
@@ -99,6 +101,7 @@ export interface SettingsMessageSettingsState {
     key: string,
     value: unknown,
   ) => Promise<DaemonSettingUpdateResult>;
+  liveSetup?: UseLiveVoiceSetupResult;
 }
 
 const SUB_DIALOG_KEYS = new Set([
@@ -112,6 +115,11 @@ const HIDDEN_SETTING_KEYS = new Set([
   'ui.enableUserFeedback',
   'ui.compactMode',
   'ui.compactInline',
+  'mcpServers',
+]);
+const LIVE_SETTING_KEYS = new Set([
+  'experimental.liveVoice.enabled',
+  'experimental.liveVoice.shortcut',
 ]);
 
 type Scope = 'user' | 'workspace';
@@ -237,7 +245,8 @@ interface CategoryGroup {
 
 type SettingsPageItem =
   | { type: 'setting'; setting: DaemonSettingDescriptor }
-  | { type: 'local'; localKey: 'chatWidth' };
+  | { type: 'local'; localKey: 'chatWidth' }
+  | { type: 'live' };
 
 interface SettingsPageCategory {
   id: string;
@@ -410,7 +419,8 @@ export function SettingsMessage({
 }: SettingsMessageProps) {
   const { language: selectedLanguage, t } = useI18n();
   const selectedTheme = useTheme();
-  const { status, settings, loading, error, reload, setValue } = settingsState;
+  const { status, settings, loading, error, reload, setValue, liveSetup } =
+    settingsState;
   const [scope, setScope] = useState<Scope>('workspace');
   const [activeCategory, setActiveCategory] = useState('');
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -420,7 +430,9 @@ export function SettingsMessage({
   const showInitialLoading = loading && !status;
   const categories = useMemo(() => {
     const visibleSettings = settings.filter(
-      (setting) => !HIDDEN_SETTING_KEYS.has(setting.key),
+      (setting) =>
+        !HIDDEN_SETTING_KEYS.has(setting.key) &&
+        !LIVE_SETTING_KEYS.has(setting.key),
     );
     const groups: SettingsPageCategory[] = groupByCategory(visibleSettings).map(
       (group) => ({
@@ -450,13 +462,25 @@ export function SettingsMessage({
       themeGroup.items.splice(themeIndex + 1, 0, localItem);
     } else {
       groups.push({
-        id: t('settings.category.UI'),
-        label: t('settings.category.UI'),
+        id: 'UI',
+        label: formatSettingCategory('UI', t),
         items: [localItem],
       });
     }
+    if (liveSetup?.supported) {
+      const experimental = groups.find((group) => group.id === 'Experimental');
+      if (experimental) {
+        experimental.items.unshift({ type: 'live' });
+      } else {
+        groups.push({
+          id: 'Experimental',
+          label: formatSettingCategory('Experimental', t),
+          items: [{ type: 'live' }],
+        });
+      }
+    }
     return groups;
-  }, [settings, t]);
+  }, [liveSetup, settings, t]);
 
   useEffect(() => {
     if (categories.length === 0) return;
@@ -784,6 +808,14 @@ export function SettingsMessage({
                               />
                             </div>
                           );
+                        }
+                        if (item.type === 'live') {
+                          return liveSetup ? (
+                            <div key="live-voice-setup">
+                              {separator}
+                              <LiveVoiceSettingsCard setup={liveSetup} />
+                            </div>
+                          ) : null;
                         }
 
                         const setting = item.setting;

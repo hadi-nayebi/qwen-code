@@ -1,8 +1,10 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type {
   ActiveGoal,
+  GoalSnapshotV2,
   SubagentConfig,
   McpToolProgressData,
+  ShellProgressData,
 } from '@qwen-code/qwen-code-core';
 
 /**
@@ -245,12 +247,17 @@ export interface MessageStopStreamEvent {
 export interface ToolProgressStreamEvent {
   type: 'tool_progress';
   tool_use_id: string;
-  content: McpToolProgressData;
+  content: McpToolProgressData | ShellProgressData;
 }
 
 export interface ActiveGoalStreamEvent {
   type: 'active_goal';
   active_goal: ActiveGoal | null;
+}
+
+export interface GoalStateStreamEvent {
+  type: 'goal_state';
+  goal_state: GoalSnapshotV2;
 }
 
 export type StreamEvent =
@@ -260,6 +267,7 @@ export type StreamEvent =
   | ContentBlockStopEvent
   | MessageStopStreamEvent
   | ToolProgressStreamEvent
+  | GoalStateStreamEvent
   | ActiveGoalStreamEvent;
 
 export interface CLIPartialAssistantMessage {

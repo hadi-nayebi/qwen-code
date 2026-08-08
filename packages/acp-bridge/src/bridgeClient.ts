@@ -24,17 +24,36 @@ import type { BridgeEvent, EventBus } from './eventBus.js';
 // SSE event type, the SDK validator + browser consumer — single sources of truth
 // so a rename can't silently break the protocol.
 import { MID_TURN_MESSAGE_INJECTED_EVENT } from './daemonEventTypes.js';
-import { MID_TURN_QUEUE_DRAIN_METHOD } from './bridgeTypes.js';
+import {
+  MID_TURN_QUEUE_DRAIN_METHOD,
+  TODO_STOP_GUARD_CONTINUATION_CLAIM_METHOD,
+} from './bridgeTypes.js';
 import type {
+  BridgeWorkspaceGenerationNotificationEvent,
+  BridgeGenerationNotificationEvent,
   BridgePendingInteraction,
   MidTurnQueueEntry,
+  PendingPromptEntry,
 } from './bridgeTypes.js';
 import { SERVE_CONTROL_EXT_METHODS } from './status.js';
+import { isValidExternalToolGuardDenialReason } from './externalToolGuard.js';
 import type {
+  ChannelDeliveryErrorCode,
+  ChannelDeliveryHandler,
+  ChannelDeliveryHostResult,
+  ChannelDeliveryInfo,
   ClientMcpMessageSender,
   CreateSubSessionHandler,
+  ExternalToolGuardHandler,
+  LiveScreenContextCaptureHandler,
+  LiveSpeakToUserHandler,
+  LiveTaskToolRequestHandler,
 } from './bridgeOptions.js';
 import {
+  CHANNEL_DELIVERY_ERROR_CODES,
+  LIVE_TASK_TOOL_NAMES,
+  MAX_LIVE_SCREEN_CONTEXT_TEXT_CHARS,
+  MAX_LIVE_SPEAK_TO_USER_MESSAGE_CHARS,
   MAX_SUB_SESSION_NAME_CHARS,
   MAX_SUB_SESSION_PROMPT_CHARS,
 } from './bridgeOptions.js';
@@ -60,6 +79,9 @@ import type {
 // Keep in sync with core `ToolNames.ARTIFACT`; acp-bridge avoids a runtime
 // import from core for this hot demux path.
 const PUBLISH_ARTIFACT_TOOL_NAME = 'artifact';
+const MAX_CHANNEL_DELIVERY_TEXT_CHARS = 100_000;
+const MAX_CHANNEL_DELIVERY_FIELD_CHARS = 2048;
+const MAX_CHANNEL_DELIVERY_ERROR_CHARS = 500;
 
 /**
  * Duck-type check for `FsError` from `cli/src/serve/fs/errors.ts`.
@@ -92,6 +114,67 @@ function isFsErrorShape(err: unknown): err is FsErrorShape {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function normalizeExternalToolGuardResult(
+  value: unknown,
+): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error('External tool guard handler returned an invalid result.');
+  }
+  const keys = Object.keys(value);
+  if (value['allowed'] === true && keys.length === 1 && keys[0] === 'allowed') {
+    return { allowed: true };
+  }
+  if (
+    value['allowed'] !== false ||
+    keys.some((key) => key !== 'allowed' && key !== 'reason')
+  ) {
+    throw new Error('External tool guard handler returned an invalid result.');
+  }
+  if (!Object.hasOwn(value, 'reason')) return { allowed: false };
+  const reason = value['reason'];
+  if (!isValidExternalToolGuardDenialReason(reason)) {
+    throw new Error('External tool guard handler returned an invalid result.');
+  }
+  return { allowed: false, reason };
+}
+
+function isBoundedChannelDeliveryString(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.trim().length > 0 &&
+    value.length <= MAX_CHANNEL_DELIVERY_FIELD_CHARS
+  );
+}
+
+function isChannelDeliveryTarget(
+  value: unknown,
+): value is ChannelDeliveryInfo['target'] {
+  if (!isRecord(value)) return false;
+  return (
+    isBoundedChannelDeliveryString(value['channelName']) &&
+    (value['type'] === 'user' || value['type'] === 'chat') &&
+    isBoundedChannelDeliveryString(value['id']) &&
+    Object.keys(value).every(
+      (key) => key === 'channelName' || key === 'type' || key === 'id',
+    )
+  );
+}
+
+function normalizeChannelDeliveryHostResult(
+  value: ChannelDeliveryHostResult,
+): ChannelDeliveryHostResult {
+  if (value.status === 'delivered') return { status: 'delivered' };
+  if (value.status === 'skipped') return { status: 'skipped' };
+  const code = CHANNEL_DELIVERY_ERROR_CODES.has(value.code)
+    ? value.code
+    : 'channel_delivery_failed';
+  const error =
+    typeof value.error === 'string' && value.error.length > 0
+      ? value.error.slice(0, MAX_CHANNEL_DELIVERY_ERROR_CHARS)
+      : 'Channel delivery failed.';
+  return { status: 'failed', code: code as ChannelDeliveryErrorCode, error };
 }
 
 function pendingInteractionOptions(
@@ -440,8 +523,10 @@ function sliceLineRange(
  * structurally satisfies this interface, so no explicit conversion
  * is required.
  *
- * Only five fields cross the boundary: `sessionId`, `events`,
- * `pendingPermissionIds`, `pendingInteractions`, `activePromptOriginatorClientId`. New fields
+ * Only the fields declared on this narrowed interface cross the boundary:
+ * `sessionId`, `events`,
+ * `pendingPermissionIds`, `pendingInteractions`, `activePromptId`,
+ * `activePromptOriginatorClientId`. New fields
  * BridgeClient grows must be added here too (and the factory's
  * `SessionEntry` is required to provide them — TS enforces the
  * structural match at the callback signature).
@@ -461,8 +546,14 @@ export interface BridgeClientSessionEntry {
    * `extMethod` can splice it. See `SessionEntry.midTurnMessageQueue`.
    */
   midTurnMessageQueue: MidTurnQueueEntry[];
+  /** Complete prompts waiting behind the currently running prompt. */
+  pendingPromptList: PendingPromptEntry[];
+  /** Bridge prompt that owns the child Guard wait for this FIFO. */
+  todoStopGuardAwaitingQueuedPromptOwnerPromptId?: string;
   /** True while a prompt is executing for this session. */
   promptActive?: boolean;
+  /** Admitted id for the prompt currently executing on this session. */
+  activePromptId?: string;
   activePromptOriginatorClientId?: string;
   /**
    * True while the bridge drives a model roundtrip; the
@@ -479,6 +570,7 @@ interface PreparedSessionUpdateFrames {
   frames: Array<Omit<BridgeEvent, 'id' | 'v'>>;
   artifacts: SessionArtifactInput[];
   trustedPublisher: boolean;
+  turn: Pick<BridgeEvent, 'promptId' | 'originatorClientId'>;
 }
 
 /**
@@ -613,6 +705,34 @@ export class BridgeClient implements Client {
      * `methodNotFound` and the tool surfaces itself as daemon-only.
      */
     private readonly onCreateSubSession?: CreateSubSessionHandler,
+    /** Request-scoped generation events are routed to a private bridge queue,
+     * never to the session EventBus. */
+    private readonly onGenerationEvent?: (
+      sessionId: string,
+      event: BridgeGenerationNotificationEvent,
+    ) => void,
+    /** Workspace generation events are session-less and routed to a
+     * private bridge queue keyed by requestId. */
+    private readonly onWorkspaceGenerationEvent?: (
+      event: BridgeWorkspaceGenerationNotificationEvent,
+    ) => void,
+    private readonly onChannelDelivery?: ChannelDeliveryHandler,
+    /** Permits pre-registration client-MCP discovery without trusting its id. */
+    private readonly hasSessionSpawnInFlight: () => boolean = () => false,
+    private readonly getLiveScreenContextCaptureHandler: () =>
+      | LiveScreenContextCaptureHandler
+      | undefined = () => undefined,
+    private readonly getLiveTaskToolRequestHandler: () =>
+      | LiveTaskToolRequestHandler
+      | undefined = () => undefined,
+    private readonly getLiveSpeakToUserHandler: () =>
+      | LiveSpeakToUserHandler
+      | undefined = () => undefined,
+    /**
+     * Managed tool guard hosted by the daemon. Kept after the Live handlers so
+     * existing direct BridgeClient constructors remain source-compatible.
+     */
+    private readonly externalToolGuard?: ExternalToolGuardHandler,
   ) {}
 
   async requestPermission(
@@ -662,6 +782,7 @@ export class BridgeClient implements Client {
     // symmetric defense for the publish-failure case.
     const published = entry.events.publish({
       type: 'permission_request',
+      ...(entry.activePromptId ? { promptId: entry.activePromptId } : {}),
       data: {
         requestId,
         sessionId: entry.sessionId,
@@ -698,6 +819,7 @@ export class BridgeClient implements Client {
       const record: PermissionRequestRecord = {
         requestId,
         sessionId: entry.sessionId,
+        promptId: entry.activePromptId,
         originatorClientId: entry.activePromptOriginatorClientId,
         allowedOptionIds,
         issuedAtMs: Date.now(),
@@ -742,9 +864,14 @@ export class BridgeClient implements Client {
       // Metrics callback failed; artifact processing must still run.
     }
     if (entry && prepared.artifacts.length > 0) {
-      await this.upsertAndPublishArtifacts(entry, prepared.artifacts, {
-        trustedPublisher: prepared.trustedPublisher,
-      });
+      await this.upsertAndPublishArtifacts(
+        entry,
+        prepared.artifacts,
+        {
+          trustedPublisher: prepared.trustedPublisher,
+        },
+        prepared.turn,
+      );
     }
   }
 
@@ -752,9 +879,12 @@ export class BridgeClient implements Client {
     params: SessionNotification,
     entry?: BridgeClientSessionEntry,
   ): PreparedSessionUpdateFrames {
-    const originator = entry?.activePromptOriginatorClientId
-      ? { originatorClientId: entry.activePromptOriginatorClientId }
-      : {};
+    const turn = {
+      ...(entry?.activePromptId ? { promptId: entry.activePromptId } : {}),
+      ...(entry?.activePromptOriginatorClientId
+        ? { originatorClientId: entry.activePromptOriginatorClientId }
+        : {}),
+    };
     const frames: Array<Omit<BridgeEvent, 'id' | 'v'>> = [];
     // A2UI-over-MCP: tool_call_update results from an A2UI UI server carry
     // the A2UI command JSON flattened by core (EmbeddedResource -> text, the
@@ -781,7 +911,7 @@ export class BridgeClient implements Client {
               _meta: { serverTimestamp: Date.now(), source: 'a2ui-bridge' },
             },
           },
-          ...originator,
+          ...turn,
         });
       }
       params = a2ui.sanitizedParams;
@@ -814,13 +944,14 @@ export class BridgeClient implements Client {
     frames.push({
       type: 'session_update',
       data: publishParams,
-      ...originator,
+      ...turn,
       ...(serverTimestamp !== undefined ? { _meta: { serverTimestamp } } : {}),
     });
     return {
       frames,
       artifacts,
       trustedPublisher: isTrustedArtifactToolUpdate(params, updateMeta),
+      turn,
     };
   }
 
@@ -833,6 +964,7 @@ export class BridgeClient implements Client {
     const artifactBatches: Array<{
       artifacts: SessionArtifactInput[];
       trustedPublisher: boolean;
+      turn: Pick<BridgeEvent, 'promptId' | 'originatorClientId'>;
     }> = [];
     for (const update of updates) {
       const prepared = this.prepareSessionUpdateFrames(
@@ -844,14 +976,20 @@ export class BridgeClient implements Client {
         artifactBatches.push({
           artifacts: prepared.artifacts,
           trustedPublisher: prepared.trustedPublisher,
+          turn: prepared.turn,
         });
       }
     }
     entry.events.seedReplayEvents(frames);
     for (const batch of artifactBatches) {
-      await this.upsertAndPublishArtifacts(entry, batch.artifacts, {
-        trustedPublisher: batch.trustedPublisher,
-      });
+      await this.upsertAndPublishArtifacts(
+        entry,
+        batch.artifacts,
+        {
+          trustedPublisher: batch.trustedPublisher,
+        },
+        batch.turn,
+      );
     }
   }
 
@@ -981,6 +1119,24 @@ export class BridgeClient implements Client {
     if (method === SERVE_CONTROL_EXT_METHODS.createSubSession) {
       return this.handleCreateSubSession(params);
     }
+    if (method === SERVE_CONTROL_EXT_METHODS.liveCaptureScreenContext) {
+      return this.handleLiveScreenContextCapture(params);
+    }
+    if (method === SERVE_CONTROL_EXT_METHODS.liveTaskTool) {
+      return this.handleLiveTaskTool(params);
+    }
+    if (method === SERVE_CONTROL_EXT_METHODS.liveSpeakToUser) {
+      return this.handleLiveSpeakToUser(params);
+    }
+    if (method === SERVE_CONTROL_EXT_METHODS.channelDelivery) {
+      return this.handleChannelDelivery(params);
+    }
+    if (method === SERVE_CONTROL_EXT_METHODS.externalToolGuardPrepare) {
+      return this.handleExternalToolGuardPrepare(params);
+    }
+    if (method === TODO_STOP_GUARD_CONTINUATION_CLAIM_METHOD) {
+      return this.handleTodoStopGuardContinuationClaim(params);
+    }
     if (method !== MID_TURN_QUEUE_DRAIN_METHOD) {
       throw RequestError.methodNotFound(method);
     }
@@ -991,11 +1147,15 @@ export class BridgeClient implements Client {
     // The drain always carries a sessionId; without one we can't route it on a
     // multi-session channel (and `resolveEntry(undefined)` would throw there),
     // so answer with an empty drain rather than poisoning the turn.
-    if (!sessionId) return { messages: [] };
+    if (!sessionId) return { messages: [], hasQueuedPrompt: false };
     const entry = this.resolveEntry(sessionId);
-    if (!entry) return { messages: [] };
+    if (!entry) return { messages: [], hasQueuedPrompt: false };
     const drained = entry.midTurnMessageQueue.splice(0);
     const messages = drained.map((item) => item.text);
+    const hasQueuedPrompt = entry.pendingPromptList.some(
+      (prompt) =>
+        prompt.state === 'queued' && !prompt.abortController.signal.aborted,
+    );
     if (drained.length > 0) {
       // `publish()` never throws — it returns `undefined` on a closed bus (see
       // EventBus.publish's never-throws contract: "Don't add try/catch wrappers
@@ -1009,16 +1169,22 @@ export class BridgeClient implements Client {
       // clients to filter on — a peer that didn't queue the message must not
       // dedupe its own coincidentally-equal entry. A mixed-originator batch (two
       // clients pushing in the same window) is rare but still routed correctly.
-      const byOriginator = new Map<string | undefined, string[]>();
+      const byOriginator = new Map<string | undefined, MidTurnQueueEntry[]>();
       for (const item of drained) {
         const group = byOriginator.get(item.originatorClientId);
-        if (group) group.push(item.text);
-        else byOriginator.set(item.originatorClientId, [item.text]);
+        if (group) group.push(item);
+        else byOriginator.set(item.originatorClientId, [item]);
       }
-      for (const [originatorClientId, texts] of byOriginator) {
+      for (const [originatorClientId, items] of byOriginator) {
+        const texts = items.map((item) => item.text);
         const published = entry.events.publish({
           type: MID_TURN_MESSAGE_INJECTED_EVENT,
-          data: { sessionId: entry.sessionId, messages: texts },
+          ...(entry.activePromptId ? { promptId: entry.activePromptId } : {}),
+          data: {
+            sessionId: entry.sessionId,
+            messages: texts,
+            messageIds: items.map((item) => item.messageId),
+          },
           ...(originatorClientId ? { originatorClientId } : {}),
         });
         writeStderrLine(
@@ -1028,7 +1194,251 @@ export class BridgeClient implements Client {
         );
       }
     }
-    return { messages };
+    return { messages, hasQueuedPrompt };
+  }
+
+  private async handleExternalToolGuardPrepare(
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (!this.externalToolGuard) {
+      throw RequestError.methodNotFound(
+        SERVE_CONTROL_EXT_METHODS.externalToolGuardPrepare,
+      );
+    }
+    const sessionId = params['sessionId'];
+    const promptId = params['promptId'];
+    const toolCallId = params['toolCallId'];
+    const toolName = params['toolName'];
+    const args = params['arguments'];
+    if (
+      typeof sessionId !== 'string' ||
+      sessionId.length === 0 ||
+      typeof promptId !== 'string' ||
+      promptId.length === 0 ||
+      typeof toolCallId !== 'string' ||
+      toolCallId.length === 0 ||
+      typeof toolName !== 'string' ||
+      toolName.length === 0 ||
+      !isRecord(args)
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'Invalid external tool guard request',
+      );
+    }
+    if (!this.ownsSession(sessionId)) {
+      throw RequestError.invalidParams(
+        undefined,
+        'External tool guard session is not owned by this connection',
+      );
+    }
+    const entry = this.resolveEntry(sessionId);
+    if (!entry || !entry.promptActive || entry.activePromptId !== promptId) {
+      throw RequestError.invalidParams(
+        undefined,
+        'External tool guard prompt is not the active prompt',
+      );
+    }
+    const decision: unknown = await this.externalToolGuard({
+      sessionId: entry.sessionId,
+      promptId: entry.activePromptId,
+      toolCallId,
+      toolName,
+      arguments: args,
+    });
+    const currentEntry = this.resolveEntry(sessionId);
+    if (
+      !this.ownsSession(sessionId) ||
+      currentEntry !== entry ||
+      !currentEntry.promptActive ||
+      currentEntry.activePromptId !== promptId
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'External tool guard prompt is no longer active',
+      );
+    }
+    return normalizeExternalToolGuardResult(decision);
+  }
+
+  private handleTodoStopGuardContinuationClaim(
+    params: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const sessionId =
+      typeof params['sessionId'] === 'string' && params['sessionId'].length > 0
+        ? params['sessionId']
+        : undefined;
+    if (!sessionId) return { claimed: false, hasQueuedPrompt: false };
+    if (!this.ownsSession(sessionId)) {
+      return { claimed: false, hasQueuedPrompt: false };
+    }
+    const entry = this.resolveEntry(sessionId);
+    if (!entry) return { claimed: false, hasQueuedPrompt: false };
+
+    const livePrompts = entry.pendingPromptList.filter(
+      (prompt) => !prompt.abortController.signal.aborted,
+    );
+    const promptId =
+      typeof params['promptId'] === 'string' && params['promptId'].length > 0
+        ? params['promptId']
+        : undefined;
+
+    if (promptId) {
+      const ownsRunningPrompt =
+        entry.activePromptId === promptId &&
+        livePrompts.some(
+          (prompt) =>
+            prompt.promptId === promptId && prompt.state === 'running',
+        );
+      const hasCompetingRunningPrompt = livePrompts.some(
+        (prompt) => prompt.promptId !== promptId && prompt.state === 'running',
+      );
+      if (!ownsRunningPrompt || hasCompetingRunningPrompt) {
+        return { claimed: false, hasQueuedPrompt: false };
+      }
+
+      const hasQueuedPrompt = livePrompts.some(
+        (prompt) => prompt.state === 'queued',
+      );
+      if (hasQueuedPrompt) {
+        entry.todoStopGuardAwaitingQueuedPromptOwnerPromptId = promptId;
+        return { claimed: false, hasQueuedPrompt: true };
+      }
+      if (entry.todoStopGuardAwaitingQueuedPromptOwnerPromptId === promptId) {
+        delete entry.todoStopGuardAwaitingQueuedPromptOwnerPromptId;
+      }
+      return { claimed: true, hasQueuedPrompt: false };
+    }
+
+    if (entry.promptActive || livePrompts.length > 0) {
+      return { claimed: false, hasQueuedPrompt: false };
+    }
+    return { claimed: true, hasQueuedPrompt: false };
+  }
+
+  private async handleChannelDelivery(
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (!this.onChannelDelivery) {
+      throw RequestError.methodNotFound(
+        SERVE_CONTROL_EXT_METHODS.channelDelivery,
+      );
+    }
+    const sessionId = params['sessionId'];
+    if (
+      typeof sessionId !== 'string' ||
+      sessionId.length === 0 ||
+      !this.ownsSession(sessionId)
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        '`sessionId` must name a session owned by this connection',
+      );
+    }
+    const entry = this.resolveEntry(sessionId);
+    if (!entry) {
+      throw RequestError.invalidParams(undefined, 'Unknown `sessionId`');
+    }
+    const deliveryId = params['deliveryId'];
+    const source = params['source'];
+    const text = params['text'];
+    const rawTarget = params['target'];
+    if (
+      !isBoundedChannelDeliveryString(deliveryId) ||
+      (source !== 'prompt' && source !== 'scheduled') ||
+      typeof text !== 'string' ||
+      text.length > MAX_CHANNEL_DELIVERY_TEXT_CHARS ||
+      !isChannelDeliveryTarget(rawTarget)
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'Invalid channel delivery request',
+      );
+    }
+    const promptId = params['promptId'];
+    const taskId = params['taskId'];
+    const firedAt = params['firedAt'];
+    const allowedKeys =
+      source === 'prompt'
+        ? new Set([
+            'sessionId',
+            'deliveryId',
+            'source',
+            'target',
+            'text',
+            'promptId',
+          ])
+        : new Set([
+            'sessionId',
+            'deliveryId',
+            'source',
+            'target',
+            'text',
+            'taskId',
+            'firedAt',
+          ]);
+    const correlationValid =
+      source === 'prompt'
+        ? isBoundedChannelDeliveryString(promptId) && promptId === deliveryId
+        : isBoundedChannelDeliveryString(taskId) &&
+          typeof firedAt === 'number' &&
+          Number.isFinite(firedAt) &&
+          deliveryId === `${taskId}:${firedAt}`;
+    if (
+      !correlationValid ||
+      !Object.keys(params).every((key) => allowedKeys.has(key))
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'Invalid channel delivery correlation',
+      );
+    }
+
+    const info: ChannelDeliveryInfo = {
+      sessionId,
+      deliveryId,
+      source,
+      target: rawTarget,
+      text,
+      ...(source === 'prompt' ? { promptId: promptId as string } : {}),
+      ...(source === 'scheduled'
+        ? { taskId: taskId as string, firedAt: firedAt as number }
+        : {}),
+    };
+    let result: ChannelDeliveryHostResult;
+    try {
+      result = normalizeChannelDeliveryHostResult(
+        await this.onChannelDelivery(info),
+      );
+    } catch {
+      result = {
+        status: 'failed',
+        code: 'channel_delivery_failed',
+        error: 'Channel delivery failed.',
+      };
+    }
+    try {
+      entry.events.publish({
+        type: 'channel_delivery_result',
+        ...(source === 'prompt' ? { promptId: promptId as string } : {}),
+        data: {
+          sessionId,
+          deliveryId,
+          source,
+          status: result.status,
+          ...(source === 'prompt' ? { promptId: promptId as string } : {}),
+          ...(source === 'scheduled'
+            ? { taskId: taskId as string, firedAt: firedAt as number }
+            : {}),
+          ...(result.status === 'failed'
+            ? { code: result.code, error: result.error }
+            : {}),
+        },
+      });
+    } catch {
+      // Best-effort: delivery already completed.
+    }
+    return result;
   }
 
   /**
@@ -1077,7 +1487,37 @@ export class BridgeClient implements Client {
         `client-hosted MCP server '${server}' is not currently connected`,
       );
     }
-    const response = await send(payload);
+    const sessionId = params['sessionId'];
+    if (
+      sessionId !== undefined &&
+      (typeof sessionId !== 'string' || sessionId.length === 0)
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        '`sessionId` must be a non-empty string when provided',
+      );
+    }
+    const ownsSession =
+      typeof sessionId === 'string' && this.ownsSession(sessionId);
+    if (
+      typeof sessionId === 'string' &&
+      !ownsSession &&
+      !this.hasSessionSpawnInFlight()
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        `Session not owned by this channel: ${sessionId}`,
+      );
+    }
+    if (typeof sessionId === 'string' && !ownsSession) {
+      writeStderrLine(
+        `[demux] session=${sessionId} type=client_mcp_message action=forwarded_without_session reason=session_registration_pending`,
+      );
+    }
+    const response = await send(
+      payload,
+      typeof sessionId === 'string' && ownsSession ? { sessionId } : undefined,
+    );
     return { payload: response as Record<string, unknown> };
   }
 
@@ -1167,6 +1607,107 @@ export class BridgeClient implements Client {
     };
   }
 
+  private async handleLiveScreenContextCapture(
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const handler = this.getLiveScreenContextCaptureHandler();
+    if (!handler) {
+      throw RequestError.methodNotFound(
+        SERVE_CONTROL_EXT_METHODS.liveCaptureScreenContext,
+      );
+    }
+    const callerSessionId = params['callerSessionId'];
+    if (
+      typeof callerSessionId !== 'string' ||
+      callerSessionId.length === 0 ||
+      !this.ownsSession(callerSessionId)
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        '`callerSessionId` is required and must name a session owned by this connection',
+      );
+    }
+    const result = await handler({ callerSessionId });
+    if (
+      result.appName.length === 0 ||
+      result.appName.length > 512 ||
+      (result.windowTitle !== undefined && result.windowTitle.length > 2_048) ||
+      result.accessibilityText.length > MAX_LIVE_SCREEN_CONTEXT_TEXT_CHARS ||
+      result.screenshotPath.length === 0 ||
+      result.screenshotPath.length > 4_096
+    ) {
+      throw RequestError.internalError(undefined, 'Invalid Appshot result.');
+    }
+    return {
+      appName: result.appName,
+      ...(result.windowTitle ? { windowTitle: result.windowTitle } : {}),
+      accessibilityText: result.accessibilityText,
+      screenshotPath: result.screenshotPath,
+    };
+  }
+
+  private async handleLiveTaskTool(
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const handler = this.getLiveTaskToolRequestHandler();
+    if (!handler) {
+      throw RequestError.methodNotFound(SERVE_CONTROL_EXT_METHODS.liveTaskTool);
+    }
+    const callerSessionId = params['callerSessionId'];
+    const name = params['name'];
+    const args = params['arguments'];
+    if (
+      typeof callerSessionId !== 'string' ||
+      callerSessionId.length === 0 ||
+      !this.ownsSession(callerSessionId) ||
+      typeof name !== 'string' ||
+      !LIVE_TASK_TOOL_NAMES.includes(
+        name as (typeof LIVE_TASK_TOOL_NAMES)[number],
+      ) ||
+      typeof args !== 'object' ||
+      args === null ||
+      Array.isArray(args)
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'Invalid Live task-tool request.',
+      );
+    }
+    return handler({
+      callerSessionId,
+      name: name as (typeof LIVE_TASK_TOOL_NAMES)[number],
+      arguments: args as Record<string, unknown>,
+    });
+  }
+
+  private async handleLiveSpeakToUser(
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const handler = this.getLiveSpeakToUserHandler();
+    if (!handler) {
+      throw RequestError.methodNotFound(
+        SERVE_CONTROL_EXT_METHODS.liveSpeakToUser,
+      );
+    }
+    const callerSessionId = params['callerSessionId'];
+    const message = params['message'];
+    if (
+      typeof callerSessionId !== 'string' ||
+      callerSessionId.length === 0 ||
+      !this.ownsSession(callerSessionId) ||
+      typeof message !== 'string' ||
+      message.trim().length === 0 ||
+      message.length > MAX_LIVE_SPEAK_TO_USER_MESSAGE_CHARS
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'Invalid Live speak-to-user request.',
+      );
+    }
+    await handler({ callerSessionId, message });
+    return { accepted: true };
+  }
+
   /**
    * Handle child->bridge ACP `extNotification` calls. Recognized methods are
    * `qwen/notify/session/model-update`,
@@ -1176,6 +1717,7 @@ export class BridgeClient implements Client {
    * `qwen/notify/session/prompt-suggestion` (followup assist),
    * `qwen/notify/session/artifact-event` (hook artifacts),
    * `qwen/notify/session/terminal-sequence`, and
+   * `_qwencode/end_turn` (background-notification turns), and
    * `qwen/notify/session/mcp-budget-event` — each translated into a
    * session-scoped SSE frame. Unknown methods are dropped silently for
    * forward-compat.
@@ -1184,6 +1726,144 @@ export class BridgeClient implements Client {
     method: string,
     params: Record<string, unknown>,
   ): Promise<void> {
+    if (method === '_qwencode/end_turn') {
+      const sessionId = params['sessionId'];
+      const reason = params['reason'];
+      if (
+        typeof sessionId !== 'string' ||
+        sessionId.length === 0 ||
+        typeof reason !== 'string' ||
+        reason.length === 0 ||
+        reason.length > 128 ||
+        params['source'] !== 'background_notification'
+      ) {
+        return;
+      }
+      const entry = this.resolveEntry(sessionId);
+      if (!entry || !this.ownsSession(sessionId)) return;
+      entry.events.publish({
+        type: 'background_notification_turn_complete',
+        data: { sessionId, reason },
+      });
+      return;
+    }
+    if (method === 'qwen/notify/session/generation/event') {
+      const sessionId = params['sessionId'];
+      const requestId = params['requestId'];
+      const event = params['event'];
+      if (
+        params['v'] !== 1 ||
+        typeof sessionId !== 'string' ||
+        typeof requestId !== 'string' ||
+        !event ||
+        typeof event !== 'object' ||
+        Array.isArray(event)
+      ) {
+        return;
+      }
+      const record = event as Record<string, unknown>;
+      if (record['type'] === 'started') {
+        const model = record['model'];
+        const modelSource = record['modelSource'];
+        if (
+          typeof model !== 'string' ||
+          (modelSource !== 'fast' && modelSource !== 'main')
+        ) {
+          return;
+        }
+        this.onGenerationEvent?.(sessionId, {
+          type: 'started',
+          requestId,
+          model,
+          modelSource,
+        });
+        return;
+      }
+      if (record['type'] === 'thinking') {
+        this.onGenerationEvent?.(sessionId, {
+          type: 'thinking',
+          requestId,
+        });
+        return;
+      }
+      if (record['type'] === 'delta') {
+        const seq = record['seq'];
+        const text = record['text'];
+        if (
+          typeof seq !== 'number' ||
+          !Number.isSafeInteger(seq) ||
+          seq < 0 ||
+          typeof text !== 'string' ||
+          text.length === 0
+        ) {
+          return;
+        }
+        this.onGenerationEvent?.(sessionId, {
+          type: 'delta',
+          requestId,
+          seq,
+          text,
+        });
+        return;
+      }
+      return;
+    }
+    if (method === 'qwen/notify/workspace/generation/event') {
+      const requestId = params['requestId'];
+      const event = params['event'];
+      if (
+        params['v'] !== 1 ||
+        typeof requestId !== 'string' ||
+        !event ||
+        typeof event !== 'object' ||
+        Array.isArray(event)
+      ) {
+        return;
+      }
+      const record = event as Record<string, unknown>;
+      if (record['type'] === 'started') {
+        const model = record['model'];
+        const modelSource = record['modelSource'];
+        if (
+          typeof model !== 'string' ||
+          (modelSource !== 'fast' && modelSource !== 'main')
+        ) {
+          return;
+        }
+        this.onWorkspaceGenerationEvent?.({
+          type: 'started',
+          requestId,
+          model,
+          modelSource,
+        });
+        return;
+      }
+      if (record['type'] === 'thinking') {
+        this.onWorkspaceGenerationEvent?.({ type: 'thinking', requestId });
+        return;
+      }
+      if (record['type'] === 'delta') {
+        const seq = record['seq'];
+        const text = record['text'];
+        if (
+          typeof seq !== 'number' ||
+          !Number.isSafeInteger(seq) ||
+          seq < 0 ||
+          typeof text !== 'string' ||
+          text.length === 0
+        ) {
+          return;
+        }
+        this.onWorkspaceGenerationEvent?.({
+          type: 'delta',
+          requestId,
+          seq,
+          text,
+        });
+        return;
+      }
+      return;
+    }
     if (method === 'qwen/notify/session/model-update') {
       this.handleInSessionModelUpdate(params);
       return;
@@ -1265,6 +1945,9 @@ export class BridgeClient implements Client {
       }
       const entry = this.resolveEntry(sessionId);
       if (!entry) return;
+      // This child-generated promptId identifies a persisted history turn, not
+      // the daemon's admitted HTTP prompt UUID. Keep it in the legacy payload
+      // and do not promote it to the envelope correlation field.
       entry.events.publish({
         type: 'followup_suggestion',
         data: { sessionId, suggestion, promptId },
@@ -1277,7 +1960,7 @@ export class BridgeClient implements Client {
       const { v: _v, sessionId: _sid, ...rest } = params;
       void _v;
       void _sid;
-      this.publishExtNotification(sessionId, 'terminal_sequence', rest);
+      this.publishExtNotification(sessionId, 'terminal_sequence', rest, true);
       return;
     }
     if (method === 'qwen/notify/session/artifact-event') {
@@ -1358,17 +2041,24 @@ export class BridgeClient implements Client {
         toolCallId,
       }),
     );
-    await this.upsertAndPublishArtifacts(entry, artifacts);
+    const turn = {
+      ...(entry.activePromptId ? { promptId: entry.activePromptId } : {}),
+      ...(entry.activePromptOriginatorClientId
+        ? { originatorClientId: entry.activePromptOriginatorClientId }
+        : {}),
+    };
+    await this.upsertAndPublishArtifacts(entry, artifacts, undefined, turn);
   }
 
   private async upsertAndPublishArtifacts(
     entry: BridgeClientSessionEntry,
     artifacts: SessionArtifactInput[],
     options?: Parameters<SessionArtifactStore['upsertMany']>[1],
+    turn: Pick<BridgeEvent, 'promptId' | 'originatorClientId'> = {},
   ): Promise<void> {
     try {
       const result = await entry.artifacts.upsertMany(artifacts, options);
-      this.publishArtifactChanges(entry, result.changes);
+      this.publishArtifactChanges(entry, result.changes, turn);
     } catch (error) {
       writeStderrLine(
         `[artifacts] session=${entry.sessionId} action=dropped reason=${JSON.stringify(
@@ -1381,14 +2071,13 @@ export class BridgeClient implements Client {
   private publishArtifactChanges(
     entry: BridgeClientSessionEntry,
     changes: SessionArtifactChange[],
+    turn: Pick<BridgeEvent, 'promptId' | 'originatorClientId'>,
   ): void {
     for (const change of changes) {
       entry.events.publish({
         type: 'artifact_changed',
         data: { sessionId: entry.sessionId, change },
-        ...(entry.activePromptOriginatorClientId
-          ? { originatorClientId: entry.activePromptOriginatorClientId }
-          : {}),
+        ...turn,
       });
     }
   }
@@ -1397,11 +2086,15 @@ export class BridgeClient implements Client {
     sessionId: string,
     type: string,
     data: Record<string, unknown>,
+    turnScoped = false,
   ): void {
     const entry = this.resolveEntry(sessionId);
     const frame: Omit<BridgeEvent, 'id' | 'v'> = {
       type,
       data,
+      ...(turnScoped && entry?.activePromptId
+        ? { promptId: entry.activePromptId }
+        : {}),
       ...(entry?.activePromptOriginatorClientId
         ? { originatorClientId: entry.activePromptOriginatorClientId }
         : {}),
@@ -1458,6 +2151,7 @@ export class BridgeClient implements Client {
       // its documented contract we don't wrap it.
       entry.events.publish({
         type: 'model_switched',
+        ...(entry.activePromptId ? { promptId: entry.activePromptId } : {}),
         data: { sessionId, modelId: currentModelId },
         ...(entry.activePromptOriginatorClientId
           ? { originatorClientId: entry.activePromptOriginatorClientId }
@@ -1535,6 +2229,7 @@ export class BridgeClient implements Client {
       // per its documented contract we don't wrap it in try/catch.
       entry.events.publish({
         type: 'approval_mode_changed',
+        ...(entry.activePromptId ? { promptId: entry.activePromptId } : {}),
         data: {
           sessionId,
           previous: 'default',
@@ -1578,6 +2273,7 @@ export class BridgeClient implements Client {
     // documented contract we don't wrap it in try/catch.
     entry.events.publish({
       type: 'session_update',
+      ...(entry.activePromptId ? { promptId: entry.activePromptId } : {}),
       data: {
         sessionId,
         update: {
