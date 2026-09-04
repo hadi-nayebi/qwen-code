@@ -91,19 +91,26 @@ test('falls back to full for source or mixed changes', () => {
   );
 });
 
-test('falls back to full for main CI workflow changes', () => {
-  assert.equal(classifyChangedFiles(['.github/workflows/ci.yml']), 'full');
+test('uses github_ci_only for allowed CI workflow changes', () => {
+  assert.equal(
+    classifyChangedFiles(['.github/workflows/ci.yml']),
+    'github_ci_only',
+  );
+  assert.equal(
+    classifyChangedFiles(['.github/workflows/qwen-code-pr-review.yml']),
+    'github_ci_only',
+  );
   assert.equal(classifyChangedFiles(['.github/workflows/codeql.yml']), 'full');
 });
 
-test('falls back to full for classifier changes', () => {
+test('uses github_ci_only for classifier changes', () => {
   assert.equal(
     classifyChangedFiles(['.github/scripts/ci/classify-profile.mjs']),
-    'full',
+    'github_ci_only',
   );
   assert.equal(
     classifyChangedFiles(['.github/scripts/ci/classify-profile.test.mjs']),
-    'full',
+    'github_ci_only',
   );
 });
 

@@ -8,9 +8,15 @@ export const CI_PROFILES = {
 };
 
 export const GITHUB_CI_ONLY_FILES = new Set([
+  '.github/scripts/ci/classify-profile.mjs',
+  '.github/scripts/ci/classify-profile.test.mjs',
   '.github/scripts/pr-safety-precheck.mjs',
   '.github/scripts/pr-safety-precheck.test.mjs',
+  '.github/workflows/ci.yml',
+  '.github/workflows/pr-force-push-reminder.yml',
+  '.github/workflows/qwen-code-pr-review.yml',
   '.github/workflows/qwen-pr-safety-precheck.yml',
+  '.github/workflows/qwen-triage.yml',
 ]);
 
 function isDocsOnlyFile(file) {
