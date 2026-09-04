@@ -1,9 +1,10 @@
 name: 'PR Force-Push Reminder'
 
+# Hadosh Academy fork policy: this upstream community-maintenance reminder is
+# not part of the Q-Seed framework workflow. Keep it available only for an
+# explicit upstream-maintenance decision; ordinary fork PRs must not spawn it.
 on:
-  pull_request_target:
-    types:
-      - 'synchronize'
+  workflow_dispatch:
 
 permissions:
   contents: 'read'
