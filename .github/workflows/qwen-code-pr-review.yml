@@ -1,20 +1,10 @@
 name: '🧐 Qwen Pull Request Review'
 
+# Hadosh Academy fork policy: this repository is the controlled framework layer
+# for Q-Seed, not an operating instance of Qwen's upstream maintainer service.
+# Retain the upstream workflow as reference and explicit tooling, but do not run
+# its credential-dependent AI reviewer automatically on fork pull requests.
 on:
-  pull_request_target:
-    types:
-      - 'opened'
-      - 'synchronize'
-      - 'reopened'
-      - 'ready_for_review'
-      - 'review_requested'
-      - 'closed'
-  issue_comment:
-    types: ['created']
-  pull_request_review_comment:
-    types: ['created']
-  pull_request_review:
-    types: ['submitted']
   workflow_dispatch:
     inputs:
       pr_number:
