@@ -1,12 +1,10 @@
 name: 'Qwen Triage'
 
+# Hadosh Academy fork policy: Q-Seed work is reviewed through the Academy's
+# user-authorized contribution process. The upstream maintainer triage service
+# is retained as explicit tooling, but it must not run automatically in this
+# fork or require upstream-only bot and model credentials.
 on:
-  issues:
-    types: ['opened']
-  pull_request_target:
-    types: ['opened', 'ready_for_review']
-  issue_comment:
-    types: ['created']
   workflow_dispatch:
     inputs:
       number:
