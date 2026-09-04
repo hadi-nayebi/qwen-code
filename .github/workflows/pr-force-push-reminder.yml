@@ -4,7 +4,13 @@ name: 'PR Force-Push Reminder'
 # not part of the Q-Seed framework workflow. Keep it available only for an
 # explicit upstream-maintenance decision; ordinary fork PRs must not spawn it.
 on:
-  workflow_dispatch:
+  pull_request_target:
+    # Preserve the upstream event contract while disabling it on every fork
+    # branch. Removing this filter deliberately re-enables the reminder.
+    branches-ignore:
+      - '**'
+    types:
+      - 'synchronize'
 
 permissions:
   contents: 'read'
