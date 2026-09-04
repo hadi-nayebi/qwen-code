@@ -51,11 +51,10 @@ jobs:
   classify_pr:
     name: 'Classify PR'
     if: "${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}"
-    # Gate runs on ECS for in-repo PRs and for the merge queue (which runs in the
-    # base-repo context), else a busy hosted pool delays it and blocks the
-    # ECS-bound jobs. The kill-switch is read here, so flipping it reverts
-    # everything to hosted.
-    runs-on: '${{ (vars.MAINTAINER_ECS_RUNNER_DISABLED != ''true'' && (github.event.pull_request.head.repo.full_name == github.repository || github.event_name == ''merge_group'')) && fromJSON(''["self-hosted", "linux", "x64", "ecs-qwen"]'') || fromJSON(''["ubuntu-latest"]'') }}'
+    # Upstream Qwen may use its ECS pool. Forks, including the Hadosh Academy
+    # framework fork, use GitHub-hosted runners and never assume access to
+    # upstream maintainer infrastructure.
+    runs-on: '${{ (github.repository == ''QwenLM/qwen-code'' && vars.MAINTAINER_ECS_RUNNER_DISABLED != ''true'' && (github.event.pull_request.head.repo.full_name == github.repository || github.event_name == ''merge_group'')) && fromJSON(''["self-hosted", "linux", "x64", "ecs-qwen"]'') || fromJSON(''["ubuntu-latest"]'') }}'
     continue-on-error: true
     outputs:
       skip_ci: '${{ steps.release_sync.outputs.skip_ci }}'
@@ -97,12 +96,13 @@ jobs:
           echo "skip_ci=${skip_ci}" >> "${GITHUB_OUTPUT}"
           echo "skip_ci=${skip_ci}"
 
-      # In-repo PR (head branch in this repo => author has write access) and the
-      # merge queue (base-repo context) run the Linux jobs on ECS; fork PRs stay
-      # hosted. Disable via repo var MAINTAINER_ECS_RUNNER_DISABLED=true.
+      # Upstream in-repo PRs and merge queues may use Qwen's ECS pool. Every
+      # fork uses hosted runners, including same-repository Q-Seed branches.
+      # Upstream can disable ECS through MAINTAINER_ECS_RUNNER_DISABLED=true.
       - name: 'Select Linux runner'
         id: 'pick_runner'
         env:
+          UPSTREAM_REPO: "${{ github.repository == 'QwenLM/qwen-code' }}"
           SAME_REPO: '${{ github.event.pull_request.head.repo.full_name == github.repository }}'
           ECS_DISABLED: '${{ vars.MAINTAINER_ECS_RUNNER_DISABLED }}'
           EVENT_NAME: '${{ github.event_name }}'
@@ -110,10 +110,10 @@ jobs:
         run: |-
           ubuntu_runner='["ubuntu-latest"]'
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            if [[ "${ECS_DISABLED}" != "true" && "${DISPATCH_LINUX_RUNNER}" == "self-hosted" ]]; then
+            if [[ "${UPSTREAM_REPO}" == "true" && "${ECS_DISABLED}" != "true" && "${DISPATCH_LINUX_RUNNER}" == "self-hosted" ]]; then
               ubuntu_runner='["self-hosted", "linux", "x64", "ecs-qwen"]'
             fi
-          elif [[ "${ECS_DISABLED}" != "true" && ( "${SAME_REPO}" == "true" || "${EVENT_NAME}" == "merge_group" ) ]]; then
+          elif [[ "${UPSTREAM_REPO}" == "true" && "${ECS_DISABLED}" != "true" && ( "${SAME_REPO}" == "true" || "${EVENT_NAME}" == "merge_group" ) ]]; then
             ubuntu_runner='["self-hosted", "linux", "x64", "ecs-qwen"]'
           fi
           echo "ubuntu_runner=${ubuntu_runner}" >> "${GITHUB_OUTPUT}"
