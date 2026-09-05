@@ -10,6 +10,7 @@ on:
   pull_request:
     branches:
       - 'main'
+      - 'qseed/main'
       - 'release/**'
   merge_group:
   workflow_dispatch:
@@ -17,12 +18,12 @@ on:
       branch_ref:
         description: 'Branch to run on'
         required: true
-        default: 'main'
+        default: 'qseed/main'
         type: 'string'
       linux_runner:
         description: 'Linux runner to use for manual validation'
         required: true
-        default: 'self-hosted'
+        default: 'hosted'
         type: 'choice'
         options:
           - 'self-hosted'
@@ -56,14 +57,15 @@ jobs:
   classify_pr:
     name: 'Classify PR'
     if: "${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}"
-    # Gate runs on ECS for in-repo PRs, fork PRs whose author has write access
+    # Only upstream Qwen may use its ECS pool; this fork always uses hosted runners.
+    # Upstream gate runs on ECS for in-repo PRs, fork PRs whose author has write access
     # (OWNER/MEMBER/COLLABORATOR association — a write-access author is as
     # trusted as an in-repo branch), and the merge queue (base-repo context),
     # else a busy hosted pool delays it and blocks the ECS-bound jobs. The
     # kill-switch is read here, so flipping it reverts everything to hosted.
     # This runs-on and the pick_runner step below are the canonical home of
     # the association routing; sdk-java.yml and serve-ab.yml mirror it.
-    runs-on: '${{ (vars.MAINTAINER_ECS_RUNNER_DISABLED != ''true'' && (github.event.pull_request.head.repo.full_name == github.repository || contains(fromJSON(''["OWNER","MEMBER","COLLABORATOR"]''), github.event.pull_request.author_association) || github.event_name == ''merge_group'')) && fromJSON(''["self-hosted", "linux", "x64", "ecs-qwen"]'') || fromJSON(''["ubuntu-latest"]'') }}'
+    runs-on: '${{ (github.repository == ''QwenLM/qwen-code'' && vars.MAINTAINER_ECS_RUNNER_DISABLED != ''true'' && (github.event.pull_request.head.repo.full_name == github.repository || contains(fromJSON(''["OWNER","MEMBER","COLLABORATOR"]''), github.event.pull_request.author_association) || github.event_name == ''merge_group'')) && fromJSON(''["self-hosted", "linux", "x64", "ecs-qwen"]'') || fromJSON(''["ubuntu-latest"]'') }}'
     continue-on-error: true
     outputs:
       skip_ci: '${{ steps.release_sync.outputs.skip_ci }}'
@@ -105,13 +107,14 @@ jobs:
           echo "skip_ci=${skip_ci}" >> "${GITHUB_OUTPUT}"
           echo "skip_ci=${skip_ci}"
 
-      # In-repo PRs, fork PRs whose author has write access
+      # Only upstream Qwen may use ECS. Its in-repo PRs and authors with write access
       # (OWNER/MEMBER/COLLABORATOR association), and the merge queue
       # (base-repo context) run the Linux jobs on ECS; other fork PRs stay
       # hosted. Disable via repo var MAINTAINER_ECS_RUNNER_DISABLED=true.
       - name: 'Select Linux runner'
         id: 'pick_runner'
         env:
+          UPSTREAM_REPO: "${{ github.repository == 'QwenLM/qwen-code' }}"
           SAME_REPO: '${{ github.event.pull_request.head.repo.full_name == github.repository }}'
           AUTHOR_ASSOCIATION: '${{ github.event.pull_request.author_association }}'
           ECS_DISABLED: '${{ vars.MAINTAINER_ECS_RUNNER_DISABLED }}'
@@ -124,10 +127,10 @@ jobs:
             OWNER|MEMBER|COLLABORATOR) trusted_author=true ;;
           esac
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            if [[ "${ECS_DISABLED}" != "true" && "${DISPATCH_LINUX_RUNNER}" == "self-hosted" ]]; then
+            if [[ "${UPSTREAM_REPO}" == "true" && "${ECS_DISABLED}" != "true" && "${DISPATCH_LINUX_RUNNER}" == "self-hosted" ]]; then
               ubuntu_runner='["self-hosted", "linux", "x64", "ecs-qwen"]'
             fi
-          elif [[ "${ECS_DISABLED}" != "true" && ( "${SAME_REPO}" == "true" || "${trusted_author}" == "true" || "${EVENT_NAME}" == "merge_group" ) ]]; then
+          elif [[ "${UPSTREAM_REPO}" == "true" && "${ECS_DISABLED}" != "true" && ( "${SAME_REPO}" == "true" || "${trusted_author}" == "true" || "${EVENT_NAME}" == "merge_group" ) ]]; then
             ubuntu_runner='["self-hosted", "linux", "x64", "ecs-qwen"]'
           fi
           echo "ubuntu_runner=${ubuntu_runner}" >> "${GITHUB_OUTPUT}"
@@ -291,7 +294,21 @@ jobs:
         if: "${{ needs.classify_pr.outputs.skip_ci != 'true' && steps.ci_profile.outputs.ci_profile == 'github_ci_only' }}"
         timeout-minutes: 5
         run: |-
-          # Keep this path dependency-free; script formatting is checked when those files hit full CI.
+          # Install only the locked YAML parser needed by helper tests, without
+          # pulling in the application workspace or running lifecycle scripts.
+          helper_deps="${RUNNER_TEMP}/qwen-ci-helper-deps"
+          mkdir -p "${helper_deps}"
+          node --input-type=module - "${helper_deps}" <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const yaml = JSON.parse(readFileSync('package-lock.json', 'utf8')).packages['node_modules/yaml'];
+          const root = { name: 'qwen-ci-helper-deps', version: '1.0.0', dependencies: { yaml: yaml.version } };
+          writeFileSync(join(process.argv[2], 'package.json'), JSON.stringify(root));
+          writeFileSync(join(process.argv[2], 'package-lock.json'), JSON.stringify({ name: root.name, version: root.version, lockfileVersion: 3, packages: { '': root, 'node_modules/yaml': yaml } }));
+          NODE
+          npm ci --prefix "${helper_deps}" --ignore-scripts --no-audit --no-fund
+          mkdir -p .github/scripts/node_modules
+          ln -sfn "${helper_deps}/node_modules/yaml" .github/scripts/node_modules/yaml
           node scripts/lint.js --setup
           node scripts/lint.js --actionlint
           node scripts/lint.js --yamllint
@@ -763,7 +780,7 @@ jobs:
     name: 'Test (windows-latest, Node 22.x)'
     needs: 'classify_pr'
     if: "${{ !cancelled() && github.event_name == 'merge_group' }}"
-    runs-on: '${{ vars.MAINTAINER_ECS_RUNNER_DISABLED != ''true'' && fromJSON(''["self-hosted", "Windows", "X64", "ecs-win"]'') || fromJSON(''["windows-2022"]'') }}'
+    runs-on: '${{ github.repository == ''QwenLM/qwen-code'' && vars.MAINTAINER_ECS_RUNNER_DISABLED != ''true'' && fromJSON(''["self-hosted", "Windows", "X64", "ecs-win"]'') || fromJSON(''["windows-2022"]'') }}'
     timeout-minutes: 60
     permissions:
       contents: 'read'

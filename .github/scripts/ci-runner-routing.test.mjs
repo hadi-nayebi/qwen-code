@@ -40,18 +40,25 @@ const pickRunner = ciDoc.jobs.classify_pr.steps.find(
 // author_association.
 function simulateRunsOn({ ecsDisabled, sameRepo, assoc, mergeGroup }) {
   const trusted = TRUSTED.includes(assoc);
-  const ecs =
-    !ecsDisabled && (sameRepo || trusted || mergeGroup);
+  const ecs = !ecsDisabled && (sameRepo || trusted || mergeGroup);
   return ecs ? ECS : HOSTED;
 }
 
 // Executes the real pick_runner shell with the same inputs and returns the
 // selected runner exactly as CI would publish it.
-function runPickRunner({ ecsDisabled, sameRepo, assoc, eventName, dispatch }) {
+function runPickRunner({
+  ecsDisabled,
+  sameRepo,
+  assoc,
+  eventName,
+  dispatch,
+  upstream = true,
+}) {
   const tmp = mkdtempSync(join(tmpdir(), 'pick-runner-'));
   const outputFile = join(tmp, 'github_output');
   const result = spawnSync('bash', ['-c', pickRunner.run], {
     env: {
+      UPSTREAM_REPO: upstream ? 'true' : 'false',
       SAME_REPO: sameRepo ? 'true' : 'false',
       AUTHOR_ASSOCIATION: assoc,
       ECS_DISABLED: ecsDisabled ? 'true' : '',
@@ -71,6 +78,48 @@ function runPickRunner({ ecsDisabled, sameRepo, assoc, eventName, dispatch }) {
 }
 
 describe('ci.yml classify_pr runner routing', () => {
+  it('checks the integration branch and defaults manual runs to hosted', () => {
+    assert.ok(ciDoc.on.pull_request.branches.includes('qseed/main'));
+    assert.equal(
+      ciDoc.on.workflow_dispatch.inputs.branch_ref.default,
+      'qseed/main',
+    );
+    assert.equal(
+      ciDoc.on.workflow_dispatch.inputs.linux_runner.default,
+      'hosted',
+    );
+    for (const expression of [
+      classifyRunsOn,
+      String(ciDoc.jobs.test_windows['runs-on']),
+    ]) {
+      assert.match(expression, /github\.repository == 'QwenLM\/qwen-code'/);
+    }
+  });
+
+  it('keeps fork-owned runs hosted even with trusted authors or self-hosted dispatch', () => {
+    for (const eventName of [
+      'pull_request',
+      'merge_group',
+      'workflow_dispatch',
+    ]) {
+      for (const assoc of [...TRUSTED, 'NONE', '']) {
+        for (const sameRepo of [true, false]) {
+          assert.equal(
+            runPickRunner({
+              upstream: false,
+              ecsDisabled: false,
+              sameRepo,
+              assoc,
+              eventName,
+              dispatch: 'self-hosted',
+            }),
+            HOSTED,
+          );
+        }
+      }
+    }
+  });
+
   it('the expression and the shell step agree on every association', () => {
     const associations = [
       ...TRUSTED,
@@ -169,7 +218,10 @@ describe('ci.yml classify_pr runner routing', () => {
       classifyRunsOn,
       /contains\(fromJSON\('\["OWNER","MEMBER","COLLABORATOR"\]'\), github\.event\.pull_request\.author_association\)/,
     );
-    assert.match(classifyRunsOn, /vars\.MAINTAINER_ECS_RUNNER_DISABLED != 'true'/);
+    assert.match(
+      classifyRunsOn,
+      /vars\.MAINTAINER_ECS_RUNNER_DISABLED != 'true'/,
+    );
     assert.match(classifyRunsOn, /github\.event_name == 'merge_group'/);
   });
 });
@@ -194,6 +246,9 @@ describe('serve-ab.yml runner routing', () => {
     );
     assert.ok(wipe, 'self-hosted reuse must not bleed one PR into the next');
     assert.equal(wipe.if, "${{ runner.environment == 'self-hosted' }}");
-    assert.match(wipe.run, /find "\$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf/);
+    assert.match(
+      wipe.run,
+      /find "\$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf/,
+    );
   });
 });
