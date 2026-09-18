@@ -24,6 +24,12 @@ const ciDoc = parse(readFileSync(join(workflowsDir, 'ci.yml'), 'utf8'));
 const serveAbDoc = parse(
   readFileSync(join(workflowsDir, 'serve-ab.yml'), 'utf8'),
 );
+const forcePushReminderDoc = parse(
+  readFileSync(
+    join(workflowsDir, 'pr-force-push-reminder.yml'),
+    'utf8',
+  ),
+);
 
 const TRUSTED = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 const ECS = '["self-hosted", "linux", "x64", "ecs-qwen"]';
@@ -249,6 +255,23 @@ describe('serve-ab.yml runner routing', () => {
     assert.match(
       wipe.run,
       /find "\$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf/,
+    );
+  });
+});
+
+describe('pr-force-push-reminder.yml fork policy', () => {
+  it('preserves the event payload contract while disabling ordinary fork runs', () => {
+    assert.deepEqual(forcePushReminderDoc.on.pull_request_target.types, [
+      'synchronize',
+    ]);
+    assert.deepEqual(
+      forcePushReminderDoc.on.pull_request_target['branches-ignore'],
+      ['**'],
+    );
+    assert.equal(forcePushReminderDoc.on.workflow_dispatch, undefined);
+    assert.match(
+      String(forcePushReminderDoc.jobs['remind-on-force-push'].if),
+      /github\.repository == 'QwenLM\/qwen-code'/,
     );
   });
 });
